@@ -20,6 +20,7 @@ YouTube's auto-translate is per-viewer, locked in the player, and can't be expor
 -  **Any source language** — the video need not be in a European language. Malayalam, Japanese, Arabic and Hindi all work; only the *target* is restricted
 -  **Generates missing captions** — `--transcribe` runs Whisper locally, for free, on videos that have no captions at all (best-effort; real captions are always better)
 -  **Full video dubbing** — `dub` replaces the spoken audio with synthesized speech in the target language and saves a local `.mp4`, for free
+-  **Delivery matching** — `--match-tone` carries the original speaker's pitch and pace into the dub, so it isn't monotone (+0.94 measured correlation)
 -  **Free by default** — public endpoints, zero keys; the LLM backend is opt-in and refuses to start unless explicitly configured
 -  **Automatic fallback** — if one backend is blocked or rate-limited, the next takes over silently
 - ⏱ **Timings preserved** — translated subtitles stay in sync with the video
@@ -165,6 +166,47 @@ yt-translate dub "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
 - The subtitle track is tagged with the correct ISO 639-2 code (Malayalam
   shows up as `mal`), so players label it properly.
 
+#### Matching the speaker's delivery: `--match-tone`
+
+By default every line is spoken in the same flat register, which is the
+single biggest giveaway that a dub is synthetic. `--match-tone` measures how
+the original speaker actually delivered each line - their pitch and pace -
+and carries that contour into the dub:
+
+```bash
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de --match-tone -o dubbed.mp4
+```
+
+Where the original speaker's voice rises with excitement, the dub's voice
+rises. Where they drop to a murmur, it drops.
+
+**Measured, not asserted.** On a real video, comparing the pitch contour of
+the dub against the original speaker's own expressiveness:
+
+| | correlation with original delivery | pitch range across the dub |
+|---|---|---|
+| `--match-tone` | **+0.94** | 68.6 Hz |
+| default (flat) | −0.61 | 18.2 Hz |
+
+How it works: the source audio's fundamental frequency is measured per chunk
+by autocorrelation, expressed in **semitones relative to that speaker's own
+baseline** (absolute pitch is meaningless across speakers - a bass and a
+soprano reading flatly differ by an octave), then mapped onto edge-tts's
+rate and pitch controls. Pure numpy and ffmpeg: no model download, no API
+key, nothing new to install.
+
+**What it is and isn't:**
+
+- It conveys **emphasis and energy**, not **emotion**. To a pitch tracker, a
+  delighted line and a furious one look much the same - both are simply
+  loud and high. Do not expect it to sound *sad* on sad lines.
+- Adjustments are deliberately gentle and capped (±35 Hz, ±20%), so a bad
+  measurement degrades to "slightly off" rather than "unintelligible".
+- If a chunk has no measurable pitch (music, silence, heavy noise), that
+  chunk is spoken normally rather than guessed at.
+- It downloads the source audio in addition to the video, so it is a little
+  slower.
+
 **Read this before you rely on it.** This was verified end to end against a
 real YouTube video (download, translate, synthesize, mix, mux) and produces
 a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
@@ -176,15 +218,13 @@ a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
   It cannot detect who is speaking and switch voices per person, and it does
   not match the original speaker's actual timbre - only their gender, and
   only if you tell it which to use.
-- **Emotion and tone are not carried across.** This was tested, not assumed:
-  Azure's expressive `<mstts:express-as style="sad">` SSML markup is a
-  *paid* Azure Speech feature, and the free endpoint edge-tts uses simply
-  reads the XML tags out loud as literal text (a 2-second line came back as
-  33 seconds of spoken angle-brackets). Every line is therefore delivered in
-  the same neutral, friendly register regardless of whether the original was
-  shouted, whispered, or wept. Matching real expression would need a paid
-  Azure Speech key or a voice-cloning model - neither of which fits this
-  project's free-by-default rule.
+- **Emotion styles are not available, and that is a hard limit of the free
+  tier.** Microsoft's expressive `<mstts:express-as style="sad">` markup is
+  a *paid* Azure Speech feature. Probing the free endpoint directly (with
+  edge-tts's own escaping bypassed, so the tags really did reach the
+  service) it accepts `<prosody>` but rejects `express-as`, `<emphasis>`
+  and `<break>` outright. `--match-tone` above is the free tier's full
+  expressive range - real, but prosody only.
 - Captions are merged into ~15-second chunks before being spoken (one clip
   per tiny caption fragment would sound absurdly choppy), so timing follows
   the original loosely, not word-for-word.

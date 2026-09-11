@@ -28,7 +28,9 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from .media import MediaError, download_audio, download_video, probe_duration
 from .models import Segment, Transcript, TranslationResult
+from .prosody import ProsodyHint, analyse_segments, measure_baseline
 from .renderers import to_srt as _render_srt
 
 __all__ = [
@@ -141,6 +143,7 @@ def dub_video(
     out_path: Path,
     max_chunk_seconds: float = 15.0,
     voice_gender: str = "female",
+    match_tone: bool = False,
     subtitles: Transcript | TranslationResult | None = None,
     subtitle_language: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -158,6 +161,11 @@ def dub_video(
         voice_gender: ``"female"`` or ``"male"``. Applies to the whole video:
             edge-tts speaks with one voice per request, so this cannot follow
             individual speakers within a video.
+        match_tone: Measure how the original speaker delivered each chunk
+            (pitch and pace) and carry that contour into the synthesized
+            speech, instead of speaking every line in the same flat register.
+            Downloads the source audio as well as the video. Conveys emphasis
+            and energy - not emotion; see :mod:`yt_translator.prosody`.
         subtitles: Optional captions to embed as a selectable subtitle track,
             e.g. the original-language :class:`Transcript`. Timings are used
             exactly as given.
@@ -190,10 +198,16 @@ def dub_video(
         video_path = _download_video(result.video_id, workdir)
         total_duration = _probe_duration(video_path)
 
+        hints: list[ProsodyHint | None] = [None] * len(chunks)
+        if match_tone:
+            source_audio = _download_source_audio(result.video_id, workdir)
+            baseline = measure_baseline(source_audio)
+            hints = list(analyse_segments(source_audio, chunks, baseline))
+
         clip_paths = []
         for i, chunk in enumerate(chunks):
             clip_path = workdir / f"chunk_{i:04d}.mp3"
-            _synthesize_chunk(chunk.text, voice, clip_path)
+            _synthesize_chunk(chunk.text, voice, clip_path, hints[i])
             clip_paths.append(clip_path)
             if on_progress:
                 on_progress(i + 1, len(chunks))
@@ -241,16 +255,31 @@ def _group_for_dubbing(segments: tuple[Segment, ...], max_span: float) -> list[S
     return chunks
 
 
-def _synthesize_chunk(text: str, voice: str, out_path: Path) -> None:
+def _synthesize_chunk(
+    text: str, voice: str, out_path: Path, hint: ProsodyHint | None = None
+) -> None:
     """Write synthesized speech for one chunk of text to ``out_path``.
+
+    Args:
+        text: What to say.
+        voice: An edge-tts voice name.
+        out_path: Where to write the mp3.
+        hint: Optional prosody adjustment. edge-tts takes rate/pitch as
+            ordinary arguments, so matching a speaker's delivery needs no
+            SSML - which is just as well, since the free endpoint rejects
+            the expressive SSML tags anyway.
 
     Raises:
         DubbingError: If synthesis fails or produces no audio.
     """
     import edge_tts
 
+    options = {}
+    if hint is not None and not hint.is_neutral:
+        options = {"rate": hint.rate, "pitch": hint.pitch}
+
     async def _run() -> None:
-        await edge_tts.Communicate(text, voice).save(str(out_path))
+        await edge_tts.Communicate(text, voice, **options).save(str(out_path))
 
     try:
         asyncio.run(_run())
@@ -267,26 +296,22 @@ def _download_video(video_id: str, workdir: Path) -> Path:
     Raises:
         DubbingError: If yt-dlp cannot fetch the video.
     """
-    import yt_dlp
-
-    options = {
-        "format": "bestvideo[ext=mp4]/bestvideo/best",
-        "outtmpl": str(workdir / f"{video_id}.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
     try:
-        with yt_dlp.YoutubeDL(options) as downloader:
-            downloader.download([f"https://www.youtube.com/watch?v={video_id}"])
-    except Exception as exc:  # noqa: BLE001 - yt-dlp raises many exception shapes
-        raise DubbingError(f"Could not download video for {video_id!r}: {exc}") from exc
+        return download_video(video_id, workdir)
+    except MediaError as exc:
+        raise DubbingError(str(exc)) from exc
 
-    produced = list(workdir.glob(f"{video_id}.*"))
-    if not produced:
-        raise DubbingError(
-            f"yt-dlp reported success but produced no video file for {video_id!r}."
-        )
-    return produced[0]
+
+def _download_source_audio(video_id: str, workdir: Path) -> Path:
+    """Download the original audio, for measuring how lines were delivered.
+
+    Raises:
+        DubbingError: If yt-dlp cannot fetch the audio.
+    """
+    try:
+        return download_audio(video_id, workdir)
+    except MediaError as exc:
+        raise DubbingError(str(exc)) from exc
 
 
 def _probe_duration(path: Path) -> float:
@@ -296,18 +321,9 @@ def _probe_duration(path: Path) -> float:
         DubbingError: If ffprobe fails or returns something unparseable.
     """
     try:
-        completed = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        return float(completed.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError) as exc:
-        raise DubbingError(f"Could not read the duration of {path.name}: {exc}") from exc
+        return probe_duration(path)
+    except MediaError as exc:
+        raise DubbingError(str(exc)) from exc
 
 
 def _build_dubbed_audio(

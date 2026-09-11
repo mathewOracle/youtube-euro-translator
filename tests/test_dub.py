@@ -142,7 +142,7 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
         monkeypatch.setattr(
             dub, "_synthesize_chunk",
-            lambda text, voice, out_path: calls.append(("synth", text, voice)),
+            lambda text, voice, out_path, hint=None: calls.append(("synth", text, voice)),
         )
         monkeypatch.setattr(
             dub, "_build_dubbed_audio",
@@ -171,7 +171,7 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(dub, "is_available", lambda: True)
         monkeypatch.setattr(dub, "_download_video", lambda video_id, workdir: workdir / "v.mp4")
         monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
-        monkeypatch.setattr(dub, "_synthesize_chunk", lambda text, voice, out_path: None)
+        monkeypatch.setattr(dub, "_synthesize_chunk", lambda text, voice, out_path, hint=None: None)
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda chunks, clips, duration, workdir: workdir / "a.wav"
         )
@@ -180,6 +180,73 @@ class TestDubVideoOrchestration:
         out_path = tmp_path / "nested" / "dir" / "dubbed.mp4"
         dub.dub_video(result, out_path=out_path)
         assert out_path.parent.is_dir()
+
+
+class TestMatchTone:
+    """The --match-tone path: measure source delivery, apply it to the dub."""
+
+    def test_tone_matching_is_off_by_default(self, result, monkeypatch, tmp_path) -> None:
+        """The default dub must not download source audio or analyse anything."""
+        analysed = []
+        monkeypatch.setattr(dub, "is_available", lambda: True)
+        monkeypatch.setattr(dub, "_download_video", lambda v, w: w / "v.mp4")
+        monkeypatch.setattr(
+            dub, "_download_source_audio",
+            lambda v, w: analysed.append("downloaded") or (w / "a.mp3"),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
+        monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: None)
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+
+        dub.dub_video(result, out_path=tmp_path / "out.mp4")
+        assert analysed == [], "source audio must not be fetched unless asked for"
+
+    def test_hints_are_passed_through_to_synthesis(self, result, monkeypatch, tmp_path) -> None:
+        from yt_translator.prosody import ProsodyHint
+
+        seen_hints = []
+        monkeypatch.setattr(dub, "is_available", lambda: True)
+        monkeypatch.setattr(dub, "_download_video", lambda v, w: w / "v.mp4")
+        monkeypatch.setattr(dub, "_download_source_audio", lambda v, w: w / "a.mp3")
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
+        monkeypatch.setattr(dub, "measure_baseline", lambda p: 200.0)
+        monkeypatch.setattr(
+            dub, "analyse_segments",
+            lambda audio, chunks, baseline: [ProsodyHint(pitch_hz=15, rate_percent=7)]
+            * len(chunks),
+        )
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda t, v, o, hint=None: seen_hints.append(hint),
+        )
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
+
+        assert seen_hints, "synthesis should have been called"
+        assert all(h is not None and h.pitch_hz == 15 for h in seen_hints)
+
+    def test_a_flat_speaker_produces_neutral_synthesis(self, result, monkeypatch, tmp_path) -> None:
+        """If nothing is measurable, hints are neutral and edge-tts gets no overrides."""
+        from yt_translator.prosody import ProsodyHint
+
+        seen = []
+        monkeypatch.setattr(dub, "is_available", lambda: True)
+        monkeypatch.setattr(dub, "_download_video", lambda v, w: w / "v.mp4")
+        monkeypatch.setattr(dub, "_download_source_audio", lambda v, w: w / "a.mp3")
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
+        monkeypatch.setattr(dub, "measure_baseline", lambda p: 0.0)
+        monkeypatch.setattr(
+            dub, "analyse_segments", lambda audio, chunks, baseline: [ProsodyHint()] * len(chunks)
+        )
+        monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: seen.append(hint))
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
+        assert all(h.is_neutral for h in seen)
 
 
 class TestSynthesizeChunk:
@@ -203,6 +270,49 @@ class TestSynthesizeChunk:
         dub._synthesize_chunk("hallo welt", "de-DE-AmalaNeural", out_path)
         assert out_path.read_bytes() == b"fake mp3 bytes"
         assert seen == {"text": "hallo welt", "voice": "de-DE-AmalaNeural"}
+
+    def test_a_prosody_hint_reaches_edge_tts(self, monkeypatch, tmp_path) -> None:
+        """rate/pitch must arrive as real edge-tts arguments, not be dropped."""
+        from yt_translator.prosody import ProsodyHint
+
+        seen = {}
+
+        class FakeCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                seen.update(kwargs)
+
+            async def save(self, path):
+                Path(path).write_bytes(b"audio")
+
+        fake_module = type(sys)("edge_tts")
+        fake_module.Communicate = FakeCommunicate
+        monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+
+        dub._synthesize_chunk(
+            "hallo", "de-DE-AmalaNeural", tmp_path / "o.mp3",
+            ProsodyHint(pitch_hz=-18, rate_percent=-9),
+        )
+        assert seen == {"rate": "-9%", "pitch": "-18Hz"}
+
+    def test_a_neutral_hint_sends_no_overrides(self, monkeypatch, tmp_path) -> None:
+        """Neutral must mean 'don't touch it', not '+0Hz' noise on every call."""
+        from yt_translator.prosody import ProsodyHint
+
+        seen = {}
+
+        class FakeCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                seen["kwargs"] = kwargs
+
+            async def save(self, path):
+                Path(path).write_bytes(b"audio")
+
+        fake_module = type(sys)("edge_tts")
+        fake_module.Communicate = FakeCommunicate
+        monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+
+        dub._synthesize_chunk("hallo", "de-DE-AmalaNeural", tmp_path / "o.mp3", ProsodyHint())
+        assert seen["kwargs"] == {}
 
     def test_wraps_a_synthesis_failure(self, monkeypatch, tmp_path) -> None:
         class ExplodingCommunicate:

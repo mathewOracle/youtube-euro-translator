@@ -1,0 +1,213 @@
+"""Measure how a speaker delivered a line, and carry that into the dub.
+
+Not emotion recognition. This measures *prosody* - pitch and pace - and
+transfers the contour, so a line the original speaker delivered high and
+fast comes out high and fast in the dub. That conveys emphasis and energy,
+which is most of what makes a flat dub sound robotic. It does not know
+whether a raised voice means joy or fury: to a pitch tracker, delighted and
+furious look much the same.
+
+Why this approach rather than emotion styles: Microsoft's expressive
+``<mstts:express-as style="sad">`` markup is a paid Azure Speech feature.
+The free endpoint edge-tts speaks to accepts ``<prosody>`` and rejects
+``express-as``, ``emphasis`` and ``break`` outright (verified against the
+live service). Prosody is therefore the whole of the free tier's expressive
+range - but it is a real one, and edge-tts exposes rate/pitch/volume as
+ordinary arguments, no SSML required.
+
+Everything here runs locally on numpy and ffmpeg. No model downloads, no
+API keys, nothing to install beyond what dubbing already needs.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from .models import Segment
+
+__all__ = ["ProsodyHint", "analyse_segments", "measure_baseline"]
+
+# Autocorrelation search band. Human speech F0 sits inside 70-350 Hz for
+# essentially every adult speaker; a tighter band than the theoretical range
+# meaningfully reduces octave errors on noisy source audio.
+_MIN_F0 = 70.0
+_MAX_F0 = 350.0
+
+_SAMPLE_RATE = 16_000
+_FRAME = 1024
+_HOP = 512
+
+# A frame quieter than this fraction of the clip's overall RMS is treated as
+# silence or room tone rather than speech.
+_VOICED_FRACTION = 0.35
+_MIN_RMS = 300.0
+
+# Mapping measured deviation onto synthesis parameters. Deliberately gentle:
+# the point is to reintroduce variation, not to produce a cartoon. Caps keep
+# a wild measurement (or an octave error that slipped through) from making a
+# line unintelligible.
+_HZ_PER_SEMITONE = 4.0
+_MAX_PITCH_HZ = 35
+_MAX_RATE_PERCENT = 20
+
+
+@dataclass(frozen=True)
+class ProsodyHint:
+    """How one chunk should be spoken, relative to the voice's default.
+
+    Attributes:
+        pitch_hz: Pitch offset in Hz, as edge-tts expects it.
+        rate_percent: Speaking-rate offset in percent.
+    """
+
+    pitch_hz: int = 0
+    rate_percent: int = 0
+
+    @property
+    def pitch(self) -> str:
+        """The ``pitch`` argument for edge-tts, e.g. ``'+12Hz'``."""
+        return f"{self.pitch_hz:+d}Hz"
+
+    @property
+    def rate(self) -> str:
+        """The ``rate`` argument for edge-tts, e.g. ``'-10%'``."""
+        return f"{self.rate_percent:+d}%"
+
+    @property
+    def is_neutral(self) -> bool:
+        """True if this asks for no change at all."""
+        return self.pitch_hz == 0 and self.rate_percent == 0
+
+
+def measure_baseline(audio_path: Path) -> float:
+    """Median pitch across a whole recording, in Hz.
+
+    This is the reference every segment is compared against. Absolute pitch
+    is meaningless on its own - a bass and a soprano reading the same line
+    flatly differ by an octave - so expressiveness is only ever interpreted
+    relative to the speaker's own habitual pitch.
+
+    Returns:
+        Median F0 in Hz, or ``0.0`` if no voiced speech was found.
+    """
+    return _median_f0(_decode(audio_path))
+
+
+def analyse_segments(
+    audio_path: Path, chunks: list[Segment], baseline_hz: float
+) -> list[ProsodyHint]:
+    """Measure each chunk's delivery against the speaker's baseline.
+
+    Args:
+        audio_path: The original audio.
+        chunks: The chunks about to be spoken, with source timings.
+        baseline_hz: This speaker's median pitch, from :func:`measure_baseline`.
+
+    Returns:
+        One :class:`ProsodyHint` per chunk, in the same order. Chunks whose
+        audio yields no measurable pitch get a neutral hint rather than a
+        guess.
+    """
+    if baseline_hz <= 0:
+        return [ProsodyHint() for _ in chunks]
+
+    hints = []
+    for chunk in chunks:
+        samples = _decode(audio_path, start=chunk.start, duration=chunk.duration)
+        median = _median_f0(samples)
+        if median <= 0:
+            hints.append(ProsodyHint())
+            continue
+        hints.append(_to_hint(_semitones(median, baseline_hz)))
+    return hints
+
+
+def _to_hint(semitones: float) -> ProsodyHint:
+    """Turn a pitch deviation in semitones into synthesis parameters.
+
+    Rate follows pitch at a reduced weight: people genuinely do speed up
+    when animated and slow down when subdued, but tying rate too tightly to
+    pitch makes excited lines gabble.
+    """
+    pitch = _clamp(round(semitones * _HZ_PER_SEMITONE), _MAX_PITCH_HZ)
+    rate = _clamp(round(semitones * _HZ_PER_SEMITONE / 2), _MAX_RATE_PERCENT)
+    return ProsodyHint(pitch_hz=pitch, rate_percent=rate)
+
+
+def _clamp(value: float, limit: int) -> int:
+    """Clamp ``value`` into ``[-limit, +limit]``."""
+    return int(max(-limit, min(limit, value)))
+
+
+def _semitones(hz: float, baseline_hz: float) -> float:
+    """Pitch difference in semitones - the perceptually even unit.
+
+    Semitones rather than raw Hz because pitch perception is logarithmic:
+    +20 Hz is dramatic for a deep voice and barely audible for a high one.
+    """
+    import math
+
+    return 12.0 * math.log2(hz / baseline_hz)
+
+
+def _decode(path: Path, start: float | None = None, duration: float | None = None) -> object:
+    """Decode (part of) an audio file to a mono float array via ffmpeg.
+
+    Returns:
+        A numpy array of samples, empty if the range holds no audio.
+    """
+    import numpy as np
+
+    command = ["ffmpeg", "-v", "error"]
+    if start is not None and duration is not None:
+        command += ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}"]
+    command += [
+        "-i", str(path),
+        "-ac", "1", "-ar", str(_SAMPLE_RATE), "-f", "s16le", "-",
+    ]
+    completed = subprocess.run(command, capture_output=True)
+    if completed.returncode != 0:
+        return np.array([], dtype=np.float32)
+    return np.frombuffer(completed.stdout, dtype=np.int16).astype(np.float32)
+
+
+def _median_f0(samples: object) -> float:
+    """Estimate median fundamental frequency by frame-wise autocorrelation.
+
+    Deliberately simple: no model, no dependencies beyond numpy. Individual
+    frames are sometimes wrong (autocorrelation is prone to octave errors),
+    but the median over a whole chunk is stable enough to drive a gentle,
+    capped prosody adjustment.
+
+    Returns:
+        Median F0 in Hz, or ``0.0`` if nothing voiced was found.
+    """
+    import numpy as np
+
+    if len(samples) < _FRAME:
+        return 0.0
+
+    overall_rms = float(np.sqrt((samples**2).mean()))
+    if overall_rms <= 0:
+        return 0.0
+    threshold = max(_MIN_RMS, overall_rms * _VOICED_FRACTION)
+
+    min_lag = int(_SAMPLE_RATE / _MAX_F0)
+    max_lag = int(_SAMPLE_RATE / _MIN_F0)
+
+    estimates = []
+    for start in range(0, len(samples) - _FRAME, _HOP):
+        frame = samples[start : start + _FRAME]
+        if np.sqrt((frame**2).mean()) < threshold:
+            continue  # Silence or room tone, not speech.
+        frame = frame - frame.mean()
+        correlation = np.correlate(frame, frame, "full")[_FRAME - 1 :]
+        if max_lag >= len(correlation):
+            continue
+        lag = int(np.argmax(correlation[min_lag:max_lag])) + min_lag
+        if lag > 0:
+            estimates.append(_SAMPLE_RATE / lag)
+
+    return float(np.median(estimates)) if estimates else 0.0

@@ -128,29 +128,12 @@ def _download_audio(video_id: str, workdir: Path) -> Path:
         TranscriptionError: If yt-dlp cannot fetch the video, or ffmpeg's
             extraction produces nothing.
     """
-    import yt_dlp
+    from .media import MediaError, download_audio
 
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": str(workdir / f"{video_id}.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "5"}
-        ],
-    }
     try:
-        with yt_dlp.YoutubeDL(options) as downloader:
-            downloader.download([f"https://www.youtube.com/watch?v={video_id}"])
-    except Exception as exc:  # noqa: BLE001 - yt-dlp raises many exception shapes
-        raise TranscriptionError(f"Could not download audio for {video_id!r}: {exc}") from exc
-
-    produced = list(workdir.glob(f"{video_id}.*"))
-    if not produced:
-        raise TranscriptionError(
-            f"yt-dlp reported success but produced no audio file for {video_id!r}."
-        )
-    return produced[0]
+        return download_audio(video_id, workdir)
+    except MediaError as exc:
+        raise TranscriptionError(str(exc)) from exc
 
 
 def _run_whisper(

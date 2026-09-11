@@ -293,7 +293,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            subtitles=None, subtitle_language=None, on_progress=None):
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
             captured["video_id"] = result.video_id
             captured["target"] = result.target_language
             captured["out_path"] = out_path
@@ -331,7 +332,8 @@ class TestDubCommand:
         dub_calls = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            subtitles=None, subtitle_language=None, on_progress=None):
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
             dub_calls["max_chunk_seconds"] = max_chunk_seconds
             if on_progress:
                 on_progress(1, 1)
@@ -356,7 +358,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            subtitles=None, subtitle_language=None, on_progress=None):
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
             captured["voice_gender"] = voice_gender
             return out_path
 
@@ -367,6 +370,29 @@ class TestDubCommand:
         )
         assert result.exit_code == 0, result.output
         assert captured["voice_gender"] == "male"
+
+    def test_match_tone_defaults_off_and_forwards_when_set(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+
+        captured = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
+            captured["match_tone"] = match_tone
+            return out_path
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+
+        runner.invoke(cli.app, ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "a.mp4")])
+        assert captured["match_tone"] is False, "tone matching must be opt-in"
+
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "b.mp4"), "--match-tone"],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["match_tone"] is True
 
     def test_rejects_an_unknown_voice(self, tmp_path) -> None:
         result = runner.invoke(
@@ -384,7 +410,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            subtitles=None, subtitle_language=None, on_progress=None):
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
             captured["subtitles"] = subtitles
             return out_path
 
@@ -406,7 +433,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            subtitles=None, subtitle_language=None, on_progress=None):
+                            match_tone=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
             captured["subtitles"] = subtitles
             return out_path
 

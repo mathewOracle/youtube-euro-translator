@@ -157,6 +157,12 @@ def dub_command(
         help=f"Speaking voice for the dub: {', '.join(dub_engine.GENDERS)}. Applies to the "
         "whole video - it cannot follow individual speakers.",
     ),
+    match_tone: bool = typer.Option(
+        False, "--match-tone",
+        help="Match the original speaker's delivery: measure their pitch and pace per "
+        "line and carry that into the dub, instead of one flat register throughout. "
+        "Conveys emphasis and energy, not emotion. Downloads the source audio too.",
+    ),
     subtitles: bool = typer.Option(
         False, "--subtitles",
         help="Embed the ORIGINAL-language captions as a selectable subtitle track "
@@ -234,7 +240,7 @@ def dub_command(
 
             dub_engine.dub_video(
                 result, out_path=output, max_chunk_seconds=max_chunk_seconds,
-                voice_gender=voice, subtitles=subtitle_track,
+                voice_gender=voice, match_tone=match_tone, subtitles=subtitle_track,
                 on_progress=advance_dub,
             )
     except (TranscriptError, TranslationError, dub_engine.DubbingError) as exc:
