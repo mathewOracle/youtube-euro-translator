@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube European Translator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    /* Visible focus for keyboard users (WCAG 2.4.7 / 2.4.11). */
+    :focus-visible { outline: 3px solid #2563eb; outline-offset: 2px; }
+    .htmx-request .idle { display: none; }
+    .busy { display: none; }
+    .htmx-request .busy { display: inline-flex; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+
+  <a href="#main"
+     class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2
+            focus:z-50 focus:bg-white focus:px-4 focus:py-2 focus:rounded
+            focus:shadow-lg focus:text-blue-800 focus:font-semibold">
+    Skip to main content
+  </a>
+
+  <header class="bg-white border-b border-slate-200">
+    <div class="max-w-3xl mx-auto px-4 py-6">
+      <h1 class="text-2xl font-bold tracking-tight">YouTube European Translator</h1>
+      <p class="mt-1 text-slate-700">
+        Translate any YouTube video into {{ languages|length }} European languages.
+        Free, no API key required.
+      </p>
+    </div>
+  </header>
+
+  <main id="main" class="max-w-3xl mx-auto px-4 py-8">
+
+    <form hx-post="/translate"
+          hx-target="#output"
+          hx-swap="innerHTML"
+          hx-disabled-elt="#submit"
+          class="bg-white rounded-lg border border-slate-200 p-6 space-y-5">
+
+      <div>
+        <label for="video" class="block text-sm font-semibold mb-1">
+          YouTube URL or video ID
+        </label>
+        <input type="text" id="video" name="video" required
+               placeholder="https://www.youtube.com/watch?v=..."
+               aria-describedby="video-help"
+               class="w-full rounded-md border border-slate-400 px-3 py-2
+                      focus:border-blue-600">
+        <p id="video-help" class="mt-1 text-sm text-slate-600">
+          The video must have captions available.
+        </p>
+      </div>
+
+      <div>
+        <label for="target" class="block text-sm font-semibold mb-1">
+          Translate into
+        </label>
+        <select id="target" name="target" required
+                class="w-full rounded-md border border-slate-400 px-3 py-2 bg-white
+                       focus:border-blue-600">
+          {% for lang in languages %}
+          <option value="{{ lang.code }}" {% if lang.code == 'de' %}selected{% endif %}>
+            {{ lang.name }} ({{ lang.endonym }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <button type="submit" id="submit"
+              class="inline-flex items-center gap-2 rounded-md bg-blue-700 px-5 py-2.5
+                     font-semibold text-white hover:bg-blue-800
+                     disabled:opacity-60 disabled:cursor-not-allowed">
+        <span class="idle">Translate</span>
+        <span class="busy items-center gap-2">
+          <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                    stroke-width="4" fill="none"></circle>
+            <path class="opacity-75" fill="currentColor"
+                  d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+          </svg>
+          Translating...
+        </span>
+      </button>
+    </form>
+
+    <!-- Announced to screen readers when results arrive (WCAG 4.1.3). -->
+    <div id="output" role="region" aria-live="polite" aria-label="Translation result"
+         class="mt-8"></div>
+
+  </main>
+
+  <footer class="max-w-3xl mx-auto px-4 py-8 text-sm text-slate-600">
+    <p>
+      Powered by free public translation services.
+      <a href="/api/docs" class="text-blue-800 underline hover:no-underline">API docs</a>
+    </p>
+  </footer>
+
+</body>
+</html>

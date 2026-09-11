@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Generated output: never commit scraped transcripts or subtitle files
+*.srt
+*.vtt
+output/
+subs/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
