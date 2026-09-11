@@ -30,7 +30,13 @@ from pathlib import Path
 
 from .media import MediaError, download_audio, download_video, probe_duration
 from .models import Segment, Transcript, TranslationResult
-from .prosody import ProsodyHint, analyse_segments, measure_baseline
+from .prosody import (
+    ProsodyHint,
+    analyse_segments,
+    classify_register,
+    measure_baseline,
+    register_offset_hz,
+)
 from .renderers import to_srt as _render_srt
 
 __all__ = [
@@ -98,6 +104,20 @@ GENDERS = ("female", "male")
 _MAX_TEMPO = 2.0
 
 
+#: Typical natural pitch of the neural voices, by register. Measured from
+#: real synthesis (de-DE-Katja sits at 205 Hz, de-DE-Conrad at 126 Hz) and
+#: applied to every voice of that register: they cluster tightly enough that
+#: per-voice measurement would cost a synthesis round-trip for a couple of
+#: Hz. The shift this feeds is capped anyway, so small errors stay harmless.
+VOICE_PITCH_HZ: dict[str, float] = {"female": 205.0, "male": 126.0}
+
+# How far the background music sits under the dubbed speech. Speech has to
+# win clearly or the dub is useless, but pulling the bed down too far is
+# indistinguishable from deleting it. -8 dB keeps music present and audible
+# while leaving the voice plainly on top.
+_BACKGROUND_DUCK_DB = -8.0
+
+
 class DubbingError(RuntimeError):
     """Raised when a video cannot be downloaded, spoken, or reassembled."""
 
@@ -144,6 +164,8 @@ def dub_video(
     max_chunk_seconds: float = 15.0,
     voice_gender: str = "female",
     match_tone: bool = False,
+    match_voice: bool = False,
+    keep_background: bool = False,
     subtitles: Transcript | TranslationResult | None = None,
     subtitle_language: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -166,6 +188,14 @@ def dub_video(
             speech, instead of speaking every line in the same flat register.
             Downloads the source audio as well as the video. Conveys emphasis
             and energy - not emotion; see :mod:`yt_translator.prosody`.
+        match_voice: Pick the male or female voice closer to the original
+            speaker's register and shift its pitch towards theirs, rather
+            than using ``voice_gender`` as given. This approximates the
+            speaker's pitch; it does not clone their voice.
+        keep_background: Separate the original audio and keep its music and
+            ambience under the dub, instead of replacing the whole soundtrack
+            with speech over silence. Needs the optional 'background' extra
+            and is slow - see :mod:`yt_translator.background`.
         subtitles: Optional captions to embed as a selectable subtitle track,
             e.g. the original-language :class:`Transcript`. Timings are used
             exactly as given.
@@ -192,17 +222,41 @@ def dub_video(
         raise DubbingError("Nothing to dub: the translation has no segments.")
 
     chunks = _group_for_dubbing(result.segments, max_chunk_seconds)
+    needs_source_audio = match_tone or match_voice or keep_background
 
     with tempfile.TemporaryDirectory(prefix="yt-translator-dub-") as workdir_str:
         workdir = Path(workdir_str)
         video_path = _download_video(result.video_id, workdir)
         total_duration = _probe_duration(video_path)
 
-        hints: list[ProsodyHint | None] = [None] * len(chunks)
-        if match_tone:
+        source_audio = None
+        if needs_source_audio:
             source_audio = _download_source_audio(result.video_id, workdir)
-            baseline = measure_baseline(source_audio)
-            hints = list(analyse_segments(source_audio, chunks, baseline))
+
+        # Separate first when possible: measuring pitch on isolated speech is
+        # far more reliable than measuring it through music.
+        background_path = None
+        speech_reference = source_audio
+        if keep_background and source_audio is not None:
+            background_path, speech_reference = _split_background(
+                source_audio, workdir, speech_reference
+            )
+
+        hints: list[ProsodyHint | None] = [None] * len(chunks)
+        if (match_tone or match_voice) and speech_reference is not None:
+            baseline = measure_baseline(speech_reference)
+
+            register_shift = 0
+            if match_voice:
+                register = classify_register(baseline)
+                if register is not None:
+                    voice = resolve_voice(result.target_language, register)
+                    register_shift = register_offset_hz(baseline, VOICE_PITCH_HZ[register])
+
+            if match_tone:
+                hints = list(analyse_segments(speech_reference, chunks, baseline, register_shift))
+            elif register_shift:
+                hints = [ProsodyHint(pitch_hz=register_shift)] * len(chunks)
 
         clip_paths = []
         for i, chunk in enumerate(chunks):
@@ -212,7 +266,9 @@ def dub_video(
             if on_progress:
                 on_progress(i + 1, len(chunks))
 
-        audio_path = _build_dubbed_audio(chunks, clip_paths, total_duration, workdir)
+        audio_path = _build_dubbed_audio(
+            chunks, clip_paths, total_duration, workdir, background_path
+        )
 
         subtitle_path = None
         if subtitles is not None:
@@ -253,6 +309,25 @@ def _group_for_dubbing(segments: tuple[Segment, ...], max_span: float) -> list[S
 
     chunks.append(Segment(start, end - start, " ".join(texts)))
     return chunks
+
+
+def _split_background(
+    source_audio: Path, workdir: Path, fallback_speech: Path | None
+) -> tuple[Path | None, Path | None]:
+    """Separate music from speech, for keeping the soundtrack under the dub.
+
+    Returns:
+        ``(background_path, speech_path)``. Separation failing is not fatal -
+        a dub without its music is still a usable dub - so on failure this
+        returns no background and leaves the speech reference untouched.
+    """
+    from .background import BackgroundError, extract_background
+
+    try:
+        background = extract_background(source_audio, workdir / "background.wav")
+    except BackgroundError:
+        return None, fallback_speech
+    return background, fallback_speech
 
 
 def _synthesize_chunk(
@@ -327,7 +402,11 @@ def _probe_duration(path: Path) -> float:
 
 
 def _build_dubbed_audio(
-    chunks: list[Segment], clip_paths: list[Path], total_duration: float, workdir: Path
+    chunks: list[Segment],
+    clip_paths: list[Path],
+    total_duration: float,
+    workdir: Path,
+    background_path: Path | None = None,
 ) -> Path:
     """Mix synthesized clips into one audio track matching the video's timeline.
 
@@ -336,26 +415,43 @@ def _build_dubbed_audio(
     A silent base track the length of the video guarantees the mix comes out
     exactly ``total_duration`` long, so muxing against the video is trivial.
 
+    If ``background_path`` is given, the original music and ambience is laid
+    underneath at a reduced level, so the dub plays over the real soundtrack
+    rather than over silence.
+
     Raises:
         DubbingError: If ffmpeg fails to build the mix.
     """
     inputs: list[str] = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={total_duration:.3f}"]
     filters: list[str] = []
     labels: list[str] = ["0:a"]
+    next_input = 1
 
-    for i, (chunk, clip_path) in enumerate(zip(chunks, clip_paths, strict=True), start=1):
+    if background_path is not None:
+        inputs += ["-i", str(background_path)]
+        # Duck the bed and force it to mono so it mixes cleanly with the
+        # mono speech clips and the mono silence base.
+        filters.append(
+            f"[{next_input}:a]volume={_BACKGROUND_DUCK_DB}dB,"
+            f"aformat=channel_layouts=mono[bg]"
+        )
+        labels.append("bg")
+        next_input += 1
+
+    for chunk, clip_path in zip(chunks, clip_paths, strict=True):
         inputs += ["-i", str(clip_path)]
         clip_duration = _probe_duration(clip_path)
         delay_ms = max(0, round(chunk.start * 1000))
         tempo = clip_duration / chunk.duration if chunk.duration > 0 else 1.0
         tempo = min(max(tempo, 1.0), _MAX_TEMPO)
 
-        stage = f"[{i}:a]"
+        stage = f"[{next_input}:a]"
         if tempo > 1.0:
             stage += f"atempo={tempo:.3f},"
-        stage += f"adelay={delay_ms}:all=1[a{i}]"
+        stage += f"adelay={delay_ms}:all=1[a{next_input}]"
         filters.append(stage)
-        labels.append(f"a{i}")
+        labels.append(f"a{next_input}")
+        next_input += 1
 
     mix_inputs = "".join(f"[{label}]" for label in labels)
     filters.append(f"{mix_inputs}amix=inputs={len(labels)}:duration=first:normalize=0[aout]")

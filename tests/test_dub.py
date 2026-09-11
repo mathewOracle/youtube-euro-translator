@@ -146,7 +146,8 @@ class TestDubVideoOrchestration:
         )
         monkeypatch.setattr(
             dub, "_build_dubbed_audio",
-            lambda chunks, clips, duration, workdir: calls.append(("mix",)) or (workdir / "a.wav"),
+            lambda chunks, clips, duration, workdir, bg=None:
+                calls.append(("mix",)) or (workdir / "a.wav"),
         )
         monkeypatch.setattr(
             dub, "_mux",
@@ -173,13 +174,130 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda text, voice, out_path, hint=None: None)
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio", lambda chunks, clips, duration, workdir: workdir / "a.wav"
+            dub, "_build_dubbed_audio",
+            lambda chunks, clips, duration, workdir, bg=None: workdir / "a.wav",
         )
         monkeypatch.setattr(dub, "_mux", lambda video, audio, out, subs=None, lang=None: None)
 
         out_path = tmp_path / "nested" / "dir" / "dubbed.mp4"
         dub.dub_video(result, out_path=out_path)
         assert out_path.parent.is_dir()
+
+
+def _stub_pipeline(monkeypatch, dub_mod, **overrides):
+    """Patch out every network/ffmpeg stage of dub_video with cheap fakes."""
+    defaults = {
+        "is_available": lambda: True,
+        "_download_video": lambda v, w: w / "v.mp4",
+        "_download_source_audio": lambda v, w: w / "a.mp3",
+        "_probe_duration": lambda p: 4.0,
+        "_synthesize_chunk": lambda t, v, o, hint=None: None,
+        "_build_dubbed_audio": lambda c, cl, d, w, bg=None: w / "a.wav",
+        "_mux": lambda v, a, o, s=None, lang=None: None,
+    }
+    for name, value in {**defaults, **overrides}.items():
+        monkeypatch.setattr(dub_mod, name, value)
+
+
+class TestKeepBackground:
+    """Preserving the original music and ambience under the dub."""
+
+    def test_background_is_not_touched_by_default(self, result, monkeypatch, tmp_path) -> None:
+        seen = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
+                seen.setdefault("bg", bg) or (w / "a.wav"),
+        )
+        dub.dub_video(result, out_path=tmp_path / "out.mp4")
+        assert seen["bg"] is None, "the default dub must not attempt separation"
+
+    def test_the_separated_track_reaches_the_mixer(self, result, monkeypatch, tmp_path) -> None:
+        seen = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            _split_background=lambda audio, w, speech: (w / "background.wav", speech),
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
+                seen.setdefault("bg", bg) or (w / "a.wav"),
+        )
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", keep_background=True)
+        assert seen["bg"] is not None
+        assert seen["bg"].name == "background.wav"
+
+    def test_a_separation_failure_still_produces_a_dub(self, result, monkeypatch, tmp_path) -> None:
+        """Losing the music is a degraded dub; losing the dub is a failure."""
+        from yt_translator.background import BackgroundError
+
+        def exploding_extract(audio_path, out_path):
+            raise BackgroundError("model unavailable")
+
+        monkeypatch.setattr(
+            "yt_translator.background.extract_background", exploding_extract
+        )
+        seen = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
+                seen.setdefault("bg", bg) or (w / "a.wav"),
+        )
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", keep_background=True)
+        assert seen["bg"] is None, "failed separation should degrade, not raise"
+
+
+class TestMatchVoice:
+    """Choosing a voice by the speaker's measured register."""
+
+    def test_a_low_voice_selects_the_male_voice(self, result, monkeypatch, tmp_path) -> None:
+        used = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            measure_baseline=lambda p: 120.0,  # clearly a low voice
+            _synthesize_chunk=lambda t, v, o, hint=None: used.setdefault("voice", v),
+        )
+        # Ask for female explicitly; --match-voice should override it.
+        dub.dub_video(
+            result, out_path=tmp_path / "out.mp4", voice_gender="female", match_voice=True
+        )
+        assert used["voice"] == dub.VOICES["de"]["male"]
+
+    def test_a_high_voice_selects_the_female_voice(self, result, monkeypatch, tmp_path) -> None:
+        used = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            measure_baseline=lambda p: 220.0,
+            _synthesize_chunk=lambda t, v, o, hint=None: used.setdefault("voice", v),
+        )
+        dub.dub_video(
+            result, out_path=tmp_path / "out.mp4", voice_gender="male", match_voice=True
+        )
+        assert used["voice"] == dub.VOICES["de"]["female"]
+
+    def test_the_voice_is_pitch_shifted_towards_the_speaker(
+        self, result, monkeypatch, tmp_path
+    ) -> None:
+        hints = []
+        _stub_pipeline(
+            monkeypatch, dub,
+            measure_baseline=lambda p: 150.0,  # male register, above Conrad's 126Hz
+            _synthesize_chunk=lambda t, v, o, hint=None: hints.append(hint),
+        )
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", match_voice=True)
+        assert hints[0] is not None
+        assert hints[0].pitch_hz > 0, "a speaker above the voice's pitch should shift it up"
+
+    def test_an_unmeasurable_speaker_keeps_the_requested_voice(
+        self, result, monkeypatch, tmp_path
+    ) -> None:
+        used = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            measure_baseline=lambda p: 0.0,
+            _synthesize_chunk=lambda t, v, o, hint=None: used.setdefault("voice", v),
+        )
+        dub.dub_video(
+            result, out_path=tmp_path / "out.mp4", voice_gender="female", match_voice=True
+        )
+        assert used["voice"] == dub.VOICES["de"]["female"], "no measurement, no override"
 
 
 class TestMatchTone:
@@ -196,7 +314,7 @@ class TestMatchTone:
         )
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: None)
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4")
@@ -213,14 +331,14 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 200.0)
         monkeypatch.setattr(
             dub, "analyse_segments",
-            lambda audio, chunks, baseline: [ProsodyHint(pitch_hz=15, rate_percent=7)]
+            lambda audio, chunks, baseline, shift=0: [ProsodyHint(pitch_hz=15, rate_percent=7)]
             * len(chunks),
         )
         monkeypatch.setattr(
             dub, "_synthesize_chunk",
             lambda t, v, o, hint=None: seen_hints.append(hint),
         )
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
@@ -239,10 +357,11 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 0.0)
         monkeypatch.setattr(
-            dub, "analyse_segments", lambda audio, chunks, baseline: [ProsodyHint()] * len(chunks)
+            dub, "analyse_segments",
+            lambda audio, chunks, baseline, shift=0: [ProsodyHint()] * len(chunks),
         )
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: seen.append(hint))
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w: w / "a.wav")
+        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)

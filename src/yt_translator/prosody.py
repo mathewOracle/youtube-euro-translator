@@ -27,7 +27,13 @@ from pathlib import Path
 
 from .models import Segment
 
-__all__ = ["ProsodyHint", "analyse_segments", "measure_baseline"]
+__all__ = [
+    "ProsodyHint",
+    "analyse_segments",
+    "classify_register",
+    "measure_baseline",
+    "register_offset_hz",
+]
 
 # Autocorrelation search band. Human speech F0 sits inside 70-350 Hz for
 # essentially every adult speaker; a tighter band than the theoretical range
@@ -95,8 +101,59 @@ def measure_baseline(audio_path: Path) -> float:
     return _median_f0(_decode(audio_path))
 
 
+#: Rough dividing line between typical adult male and female speaking pitch.
+#: Male voices commonly sit around 85-155 Hz and female around 165-255 Hz;
+#: 160 splits them about as well as a single number can. This only picks a
+#: starting voice - the pitch shift afterwards does the real matching.
+_REGISTER_SPLIT_HZ = 160.0
+
+
+def classify_register(baseline_hz: float) -> str | None:
+    """Guess whether a measured voice is closer to a male or female TTS voice.
+
+    Args:
+        baseline_hz: The speaker's median pitch, from :func:`measure_baseline`.
+
+    Returns:
+        ``"male"``, ``"female"``, or ``None`` if nothing was measurable -
+        in which case callers should keep whatever the user asked for rather
+        than guessing.
+    """
+    if baseline_hz <= 0:
+        return None
+    return "male" if baseline_hz < _REGISTER_SPLIT_HZ else "female"
+
+
+# How far the chosen voice may be shifted to sit on the speaker's register.
+# Wider than the per-line expressive range, because this is a one-off
+# correction towards a measured target rather than a per-line embellishment,
+# but still capped: pushed too far, neural voices turn buzzy and artificial.
+_MAX_REGISTER_SHIFT_HZ = 50
+
+
+def register_offset_hz(speaker_hz: float, voice_hz: float) -> int:
+    """Pitch shift that moves a TTS voice onto a speaker's register.
+
+    Chooses the shift in Hz because that is the unit edge-tts accepts, but
+    clamps it so an odd measurement cannot make the voice unusable.
+
+    Args:
+        speaker_hz: The original speaker's baseline pitch.
+        voice_hz: The chosen TTS voice's natural baseline pitch.
+
+    Returns:
+            A pitch offset in Hz, or ``0`` if either measurement is missing.
+    """
+    if speaker_hz <= 0 or voice_hz <= 0:
+        return 0
+    return _clamp(round(speaker_hz - voice_hz), _MAX_REGISTER_SHIFT_HZ)
+
+
 def analyse_segments(
-    audio_path: Path, chunks: list[Segment], baseline_hz: float
+    audio_path: Path,
+    chunks: list[Segment],
+    baseline_hz: float,
+    register_shift_hz: int = 0,
 ) -> list[ProsodyHint]:
     """Measure each chunk's delivery against the speaker's baseline.
 
@@ -104,36 +161,42 @@ def analyse_segments(
         audio_path: The original audio.
         chunks: The chunks about to be spoken, with source timings.
         baseline_hz: This speaker's median pitch, from :func:`measure_baseline`.
+        register_shift_hz: A constant pitch offset applied to every chunk, to
+            sit the synthetic voice on the speaker's register. Per-line
+            expressiveness rides on top of this.
 
     Returns:
         One :class:`ProsodyHint` per chunk, in the same order. Chunks whose
-        audio yields no measurable pitch get a neutral hint rather than a
-        guess.
+        audio yields no measurable pitch get the register shift only, rather
+        than an invented contour.
     """
     if baseline_hz <= 0:
-        return [ProsodyHint() for _ in chunks]
+        return [ProsodyHint(pitch_hz=register_shift_hz) for _ in chunks]
 
     hints = []
     for chunk in chunks:
         samples = _decode(audio_path, start=chunk.start, duration=chunk.duration)
         median = _median_f0(samples)
         if median <= 0:
-            hints.append(ProsodyHint())
+            hints.append(ProsodyHint(pitch_hz=register_shift_hz))
             continue
-        hints.append(_to_hint(_semitones(median, baseline_hz)))
+        hints.append(_to_hint(_semitones(median, baseline_hz), register_shift_hz))
     return hints
 
 
-def _to_hint(semitones: float) -> ProsodyHint:
+def _to_hint(semitones: float, register_shift_hz: int = 0) -> ProsodyHint:
     """Turn a pitch deviation in semitones into synthesis parameters.
 
     Rate follows pitch at a reduced weight: people genuinely do speed up
     when animated and slow down when subdued, but tying rate too tightly to
     pitch makes excited lines gabble.
+
+    The register shift is added after clamping the expressive part, so
+    matching a deep voice never eats the budget for per-line expression.
     """
-    pitch = _clamp(round(semitones * _HZ_PER_SEMITONE), _MAX_PITCH_HZ)
+    expressive = _clamp(round(semitones * _HZ_PER_SEMITONE), _MAX_PITCH_HZ)
     rate = _clamp(round(semitones * _HZ_PER_SEMITONE / 2), _MAX_RATE_PERCENT)
-    return ProsodyHint(pitch_hz=pitch, rate_percent=rate)
+    return ProsodyHint(pitch_hz=expressive + register_shift_hz, rate_percent=rate)
 
 
 def _clamp(value: float, limit: int) -> int:

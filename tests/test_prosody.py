@@ -165,6 +165,73 @@ class TestAnalyseSegments:
         assert prosody.analyse_segments(tmp_path / "x.mp3", [], 200.0) == []
 
 
+class TestRegisterMatching:
+    """Choosing and shifting a voice towards the speaker's own register."""
+
+    def test_a_low_voice_classifies_as_male(self) -> None:
+        assert prosody.classify_register(110.0) == "male"
+
+    def test_a_high_voice_classifies_as_female(self) -> None:
+        assert prosody.classify_register(210.0) == "female"
+
+    def test_an_unmeasurable_voice_gives_no_opinion(self) -> None:
+        """No measurement must mean 'keep what the user asked for', not a coin flip."""
+        assert prosody.classify_register(0.0) is None
+
+    def test_the_shift_closes_the_gap_to_the_speaker(self) -> None:
+        # Real measurements: this source speaker sits at 144Hz, the male
+        # voice at 126Hz, so the voice needs nudging up by ~18Hz.
+        assert prosody.register_offset_hz(144.0, 126.0) == 18
+
+    def test_the_shift_can_be_negative(self) -> None:
+        assert prosody.register_offset_hz(180.0, 205.0) == -25
+
+    def test_an_extreme_gap_is_clamped(self) -> None:
+        """Pushed too far, neural voices turn buzzy - so the shift is capped."""
+        assert prosody.register_offset_hz(300.0, 100.0) == prosody._MAX_REGISTER_SHIFT_HZ
+
+    def test_missing_measurements_produce_no_shift(self) -> None:
+        assert prosody.register_offset_hz(0.0, 126.0) == 0
+        assert prosody.register_offset_hz(144.0, 0.0) == 0
+
+
+class TestRegisterShiftInHints:
+    """The register shift rides underneath per-line expressiveness."""
+
+    def test_the_shift_is_added_to_every_hint(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(prosody, "_decode", lambda *a, **k: [1])
+        monkeypatch.setattr(prosody, "_median_f0", lambda samples: 200.0)
+        chunks = [Segment(0.0, 1.0, "x")]
+        hints = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0, register_shift_hz=20)
+        assert hints[0].pitch_hz == 20, "a level chunk should carry just the register shift"
+
+    def test_expressiveness_rides_on_top_of_the_shift(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(prosody, "_decode", lambda *a, **k: [1])
+        monkeypatch.setattr(prosody, "_median_f0", lambda samples: 400.0)  # an octave up
+        chunks = [Segment(0.0, 1.0, "x")]
+        shifted = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0, register_shift_hz=20)
+        unshifted = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0)
+        assert shifted[0].pitch_hz == unshifted[0].pitch_hz + 20
+
+    def test_the_shift_survives_an_unmeasurable_chunk(self, monkeypatch, tmp_path) -> None:
+        """A silent chunk should still be spoken in the matched register."""
+        monkeypatch.setattr(prosody, "_decode", lambda *a, **k: [])
+        monkeypatch.setattr(prosody, "_median_f0", lambda samples: 0.0)
+        chunks = [Segment(0.0, 1.0, "x")]
+        hints = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0, register_shift_hz=15)
+        assert hints[0].pitch_hz == 15
+
+    def test_the_shift_applies_without_any_baseline(self, tmp_path) -> None:
+        chunks = [Segment(0.0, 1.0, "x"), Segment(1.0, 1.0, "y")]
+        hints = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 0.0, register_shift_hz=12)
+        assert all(h.pitch_hz == 12 for h in hints)
+
+    def test_expressive_clamping_happens_before_the_shift(self) -> None:
+        """Matching a deep voice must not eat the budget for expression."""
+        hint = prosody._to_hint(48.0, register_shift_hz=-30)
+        assert hint.pitch_hz == prosody._MAX_PITCH_HZ - 30
+
+
 class TestDecodeFailure:
     """ffmpeg problems degrade to neutral rather than crashing the dub."""
 

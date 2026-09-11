@@ -293,8 +293,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["video_id"] = result.video_id
             captured["target"] = result.target_language
             captured["out_path"] = out_path
@@ -332,8 +332,8 @@ class TestDubCommand:
         dub_calls = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             dub_calls["max_chunk_seconds"] = max_chunk_seconds
             if on_progress:
                 on_progress(1, 1)
@@ -358,8 +358,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["voice_gender"] = voice_gender
             return out_path
 
@@ -377,8 +377,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["match_tone"] = match_tone
             return out_path
 
@@ -410,8 +410,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["subtitles"] = subtitles
             return out_path
 
@@ -433,8 +433,8 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
-                            match_tone=False, subtitles=None, subtitle_language=None,
-                            on_progress=None):
+                            match_tone=False, match_voice=False, keep_background=False,
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["subtitles"] = subtitles
             return out_path
 

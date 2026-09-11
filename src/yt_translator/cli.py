@@ -163,6 +163,18 @@ def dub_command(
         "line and carry that into the dub, instead of one flat register throughout. "
         "Conveys emphasis and energy, not emotion. Downloads the source audio too.",
     ),
+    match_voice: bool = typer.Option(
+        False, "--match-voice",
+        help="Pick the voice closer to the original speaker's register and shift its "
+        "pitch towards theirs, overriding --voice. Approximates their pitch; it does "
+        "not clone their voice.",
+    ),
+    keep_background: bool = typer.Option(
+        False, "--keep-background",
+        help="Keep the original music and ambience under the dub instead of replacing "
+        "the whole soundtrack. Needs the 'background' extra and is slow (separates the "
+        "audio with a local model).",
+    ),
     subtitles: bool = typer.Option(
         False, "--subtitles",
         help="Embed the ORIGINAL-language captions as a selectable subtitle track "
@@ -240,7 +252,8 @@ def dub_command(
 
             dub_engine.dub_video(
                 result, out_path=output, max_chunk_seconds=max_chunk_seconds,
-                voice_gender=voice, match_tone=match_tone, subtitles=subtitle_track,
+                voice_gender=voice, match_tone=match_tone, match_voice=match_voice,
+                keep_background=keep_background, subtitles=subtitle_track,
                 on_progress=advance_dub,
             )
     except (TranscriptError, TranslationError, dub_engine.DubbingError) as exc:

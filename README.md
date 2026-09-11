@@ -20,7 +20,8 @@ YouTube's auto-translate is per-viewer, locked in the player, and can't be expor
 -  **Any source language** — the video need not be in a European language. Malayalam, Japanese, Arabic and Hindi all work; only the *target* is restricted
 -  **Generates missing captions** — `--transcribe` runs Whisper locally, for free, on videos that have no captions at all (best-effort; real captions are always better)
 -  **Full video dubbing** — `dub` replaces the spoken audio with synthesized speech in the target language and saves a local `.mp4`, for free
--  **Delivery matching** — `--match-tone` carries the original speaker's pitch and pace into the dub, so it isn't monotone (+0.94 measured correlation)
+-  **Keeps the soundtrack** — `--keep-background` preserves the original music and ambience under the dub instead of dubbing over silence
+-  **Voice + delivery matching** — `--match-voice` matches the speaker's register, `--match-tone` carries their pitch and pace (+0.94 measured correlation)
 -  **Free by default** — public endpoints, zero keys; the LLM backend is opt-in and refuses to start unless explicitly configured
 -  **Automatic fallback** — if one backend is blocked or rate-limited, the next takes over silently
 - ⏱ **Timings preserved** — translated subtitles stay in sync with the video
@@ -166,6 +167,61 @@ yt-translate dub "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
 - The subtitle track is tagged with the correct ISO 639-2 code (Malayalam
   shows up as `mal`), so players label it properly.
 
+#### Keeping the music: `--keep-background`
+
+By default, dubbing replaces the **entire** soundtrack, so the music, the
+ambience and the room all disappear along with the original speech - the dub
+plays over silence. `--keep-background` separates the original audio into
+voice and everything-else, discards only the voice, and lays the dub over
+the real soundtrack:
+
+```bash
+uv pip install -e ".[background]"
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de --keep-background -o dubbed.mp4
+```
+
+**Measured.** Two dubs of the same video, identical but for this flag:
+
+| | frames of dead silence | audio in those gaps |
+|---|---|---|
+| `--keep-background` | **0%** | matches original soundtrack, r = **+0.90** |
+| default | 44.4% | nothing |
+
+Separation uses [Demucs](https://github.com/adefossez/demucs), which runs
+locally on CPU - free, no key. Costs: a few hundred MB of model on first
+run, and roughly half of real time to separate. Separation is imperfect on
+dense mixes (faint vocal traces can remain, and heavy music can bleed into
+the removed stem), and if it fails outright you still get a working dub,
+just without its music.
+
+#### Matching the speaker's voice: `--match-voice`
+
+`--voice male|female` is a manual choice. `--match-voice` measures the
+original speaker instead: it picks whichever voice is closer to their
+register, then shifts its pitch towards their actual measured pitch.
+
+```bash
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de --match-voice -o dubbed.mp4
+```
+
+For example: a source speaker measured at 144 Hz, against a male voice whose
+natural pitch is 126 Hz, gets a +18 Hz correction. It overrides `--voice`,
+and falls back to whatever you asked for if the speaker cannot be measured.
+
+**This approximates the speaker's pitch. It does not clone their voice.** It
+will not sound like them - timbre, accent and vocal character are untouched.
+Real cloning needs XTTS-style models, which do not install cleanly here
+(their dependency resolution conflicts with this project's) and are far
+heavier than everything else combined.
+
+Combine the lot:
+
+```bash
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de \
+    --match-voice --match-tone --keep-background \
+    --subtitles --subtitle-language source -o dubbed.mp4
+```
+
 #### Matching the speaker's delivery: `--match-tone`
 
 By default every line is spoken in the same flat register, which is the
@@ -214,10 +270,13 @@ a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
 - Voice synthesis is via [edge-tts](https://github.com/rany2/edge-tts) -
   free, no API key, good quality - but it is Microsoft's generic neural
   voices, not the speaker's own voice, and not lip-synced.
-- **One voice per video.** `--voice male/female` applies to the whole file.
-  It cannot detect who is speaking and switch voices per person, and it does
-  not match the original speaker's actual timbre - only their gender, and
-  only if you tell it which to use.
+- **One voice per video.** `--voice` (or `--match-voice`) applies to the
+  whole file. There is no diarization, so it cannot detect who is speaking
+  and switch voices per person - a two-hander comes out in a single voice,
+  and `--match-voice` picks whichever register dominates the video.
+- **It cannot clone a voice.** `--match-voice` matches *register* and
+  `--match-tone` matches *delivery*, but timbre, accent and vocal character
+  remain those of the Microsoft neural voice.
 - **Emotion styles are not available, and that is a hard limit of the free
   tier.** Microsoft's expressive `<mstts:express-as style="sad">` markup is
   a *paid* Azure Speech feature. Probing the free endpoint directly (with
