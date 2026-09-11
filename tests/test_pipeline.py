@@ -9,8 +9,9 @@ from __future__ import annotations
 import pytest
 
 from yt_translator.models import Segment, Transcript
-from yt_translator.pipeline import translate_transcript
+from yt_translator.pipeline import translate_transcript, translate_video
 from yt_translator.providers import ChainTranslator, TranslationError, get_translator
+from yt_translator.transcript import TranscriptError
 
 from .conftest import AlwaysFailsTranslator, FakeTranslator
 
@@ -133,6 +134,72 @@ class TestResilience:
         spy = FakeTranslator()
         out = spy.translate_many([f"item {i}" for i in range(20)], "de")
         assert out == [f"[de] ITEM {i}" for i in range(20)]
+
+
+class TestTranscribeFallback:
+    """translate_video()'s opt-in fallback to local speech-to-text."""
+
+    def test_does_not_transcribe_by_default(self, monkeypatch, fake_translator) -> None:
+        """Without --transcribe, a caption failure must surface immediately."""
+
+        def no_captions(video, preferred=None):
+            raise TranscriptError("no captions here")
+
+        monkeypatch.setattr("yt_translator.pipeline.fetch_transcript", no_captions)
+        with pytest.raises(TranscriptError, match="no captions here"):
+            translate_video("dQw4w9WgXcQ", "de", provider=fake_translator)
+
+    def test_falls_back_to_transcription_when_asked(self, monkeypatch, fake_translator) -> None:
+        def no_captions(video, preferred=None):
+            raise TranscriptError("no captions here")
+
+        transcribed = Transcript(
+            video_id="dQw4w9WgXcQ",
+            language="ml",
+            segments=(Segment(0.0, 2.0, "generated text"),),
+            is_generated=True,
+        )
+        monkeypatch.setattr("yt_translator.pipeline.fetch_transcript", no_captions)
+        monkeypatch.setattr(
+            "yt_translator.transcribe.transcribe_video", lambda *a, **k: transcribed
+        )
+
+        result = translate_video(
+            "dQw4w9WgXcQ", "de", provider=fake_translator, transcribe=True
+        )
+        assert result.source_language == "ml"
+        assert len(result.segments) == 1
+
+    def test_does_not_transcribe_when_captions_already_exist(
+        self, monkeypatch, fake_translator, transcript
+    ) -> None:
+        """Real captions must always be preferred over generating new ones."""
+        called = []
+        monkeypatch.setattr(
+            "yt_translator.pipeline.fetch_transcript", lambda v, preferred=None: transcript
+        )
+        monkeypatch.setattr(
+            "yt_translator.transcribe.transcribe_video",
+            lambda *a, **k: called.append(1),
+        )
+        translate_video("dQw4w9WgXcQ", "de", provider=fake_translator, transcribe=True)
+        assert not called, "transcription must not run when captions were found"
+
+    def test_a_transcription_failure_still_surfaces_as_transcript_error(
+        self, monkeypatch, fake_translator
+    ) -> None:
+        from yt_translator.transcribe import TranscriptionError
+
+        def no_captions(video, preferred=None):
+            raise TranscriptError("no captions here")
+
+        def broken_transcribe(*a, **k):
+            raise TranscriptionError("whisper is not installed")
+
+        monkeypatch.setattr("yt_translator.pipeline.fetch_transcript", no_captions)
+        monkeypatch.setattr("yt_translator.transcribe.transcribe_video", broken_transcribe)
+        with pytest.raises(TranscriptError, match="whisper is not installed"):
+            translate_video("dQw4w9WgXcQ", "de", provider=fake_translator, transcribe=True)
 
 
 class TestProviderFactory:

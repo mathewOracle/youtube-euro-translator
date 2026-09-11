@@ -18,6 +18,7 @@ YouTube's auto-translate is per-viewer, locked in the player, and can't be expor
 
 -  **38 European languages** — from Spanish and German down to Welsh, Maltese and Basque
 -  **Any source language** — the video need not be in a European language. Malayalam, Japanese, Arabic and Hindi all work; only the *target* is restricted
+-  **Generates missing captions** — `--transcribe` runs Whisper locally, for free, on videos that have no captions at all (best-effort; real captions are always better)
 -  **Free by default** — public endpoints, zero keys; the LLM backend is opt-in and refuses to start unless explicitly configured
 -  **Automatic fallback** — if one backend is blocked or rate-limited, the next takes over silently
 - ⏱ **Timings preserved** — translated subtitles stay in sync with the video
@@ -46,9 +47,6 @@ yt-translate url "https://youtu.be/VIDEO_ID" --to de --format srt -o subs.srt
 # Plain prose to your terminal
 yt-translate url "https://youtu.be/VIDEO_ID" --to french
 
-# Source need not be European: a Malayalam video with German subtitles
-yt-translate url "https://youtu.be/gcSY3MuTaAY" --to de --format srt -o de.srt
-
 # Translate one video into several languages at once
 yt-translate url "https://youtu.be/VIDEO_ID" --to es --to it --to pl --outdir ./subs
 
@@ -58,6 +56,74 @@ yt-translate captions "https://youtu.be/VIDEO_ID"
 # List everything we can translate into
 yt-translate languages
 ```
+
+### Malayalam -> a European language
+
+The **source** language is unrestricted - only the 38-language *target* list is
+European. A Malayalam video works exactly the same way as an English one:
+
+```bash
+# Malayalam sermon -> German prose, straight to your terminal
+yt-translate url "https://www.youtube.com/watch?v=gcSY3MuTaAY" --to german
+
+# Same video -> French subtitles, saved to a file
+yt-translate url "https://www.youtube.com/watch?v=gcSY3MuTaAY" --to fr --format srt -o malayalam-fr.srt
+
+# The same Malayalam video into several European languages at once
+yt-translate url "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
+    --to de --to fr --to es --to it --format srt --outdir ./malayalam-subs
+
+# No need to tell it the source is Malayalam - it is auto-detected from the
+# video's own captions. --source is only a hint for picking between multiple
+# caption tracks when a video has several.
+```
+
+If a Malayalam video has **no captions at all**, add `--transcribe` - see the
+next section.
+
+### No captions? Generate them locally with `--transcribe`
+
+Most YouTube videos have captions (manual or auto-generated), which is what
+everything above uses. For the rare video with none, `--transcribe` runs
+[Whisper](https://github.com/openai/whisper) on your own machine to generate
+them first:
+
+```bash
+# One-time setup: the ASR stack is optional and heavy, so it is not
+# installed by default.
+uv pip install -e ".[asr]"
+brew install ffmpeg          # Whisper and yt-dlp both need it
+
+# Now it works on a video with no captions at all
+yt-translate url "https://youtu.be/VIDEO_ID" --to de --transcribe
+
+# Always pass --source when you know the spoken language: Whisper's own
+# language detection is unreliable on short, sung, or lower-resource-language
+# audio, and a wrong guess produces fluent-looking nonsense, not an error.
+yt-translate url "https://youtu.be/VIDEO_ID" --to de --transcribe --source ml
+
+# Bigger models are slower on CPU but meaningfully more accurate for
+# anything other than clear English speech - worth it for a language like
+# Malayalam.
+yt-translate url "https://youtu.be/VIDEO_ID" --to de --transcribe \
+    --source ml --whisper-model medium
+```
+
+**Be realistic about quality.** This was tested end to end against a real
+Malayalam sermon recording. The mechanics work - audio downloads, Whisper
+runs, segments come out with correct timings - but on that recording
+(reverb-heavy church audio with sung passages), the `tiny` and `base` models
+produced fluent-looking garbage in the wrong scripts entirely, and even
+`small` struggled on anything but the clearest spoken passages. This is a
+genuine limitation of Whisper on lower-resource languages and difficult
+audio, not a bug in this tool. **Real YouTube captions, when they exist, are
+essentially always better than anything generated here** - use `--transcribe`
+only as a last resort, prefer `medium` or `large` for non-English audio, and
+proofread the result.
+
+It is still free - Whisper runs entirely on your own CPU, no API key, no
+per-minute billing - just slower and less reliable than captions someone
+already wrote.
 
 ### Web UI
 
@@ -97,7 +163,7 @@ yt-translate url "..." --to de --provider llm \
 
 ## Requirements
 
-The video needs **captions available** (manual or auto-generated) — that's the vast majority of YouTube. Videos with subtitles disabled by the owner can't be processed; you'll get a clear message saying so rather than a stack trace.
+The video needs **captions available** (manual or auto-generated) — that's the vast majority of YouTube. For the rare video without any, `--transcribe` generates them locally instead of failing (see above); otherwise you'll get a clear message rather than a stack trace.
 
 The **source** language is unrestricted. The 38-language list below is what you can translate *into*; a Malayalam, Japanese or Arabic video translating into German works exactly the same way.
 
@@ -114,9 +180,11 @@ Captions arrive as hundreds of tiny fragments. Translating each one separately w
 
 ```bash
 uv pip install -e ".[dev]"
-pytest              # test suite
+pytest              # test suite (heavy ASR tests are mocked, no torch needed)
 ruff check src      # lint
 ```
+
+To work on the speech-to-text fallback itself: `uv pip install -e ".[dev,asr]"` and `brew install ffmpeg`.
 
 ## Language support
 

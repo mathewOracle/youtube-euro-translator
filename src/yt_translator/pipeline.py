@@ -7,7 +7,8 @@ from collections.abc import Callable
 from .languages import resolve
 from .models import Transcript, TranslationResult
 from .providers import Translator, get_translator
-from .transcript import fetch_transcript
+from .transcribe import DEFAULT_MODEL
+from .transcript import TranscriptError, fetch_transcript
 
 __all__ = ["translate_transcript", "translate_video"]
 
@@ -24,24 +25,40 @@ def translate_video(
     source: str | None = None,
     provider: str | Translator = "auto",
     on_progress: Callable[[int, int], None] | None = None,
+    transcribe: bool = False,
+    whisper_model: str = DEFAULT_MODEL,
 ) -> TranslationResult:
     """Fetch a YouTube transcript and translate it.
 
     Args:
         url_or_id: YouTube URL or bare video id.
         target: Target language, as ISO code or English name.
-        source: Optional source language hint for caption selection.
+        source: Optional source language hint for caption selection, and for
+            the speech-to-text fallback below.
         provider: Backend name, or a ready-made :class:`Translator`.
         on_progress: Optional ``(done, total)`` progress callback.
+        transcribe: If the video has no captions, generate them locally with
+            Whisper instead of failing. Needs the optional 'asr' extra. Free,
+            but slow, and less accurate than real captions - see
+            :mod:`yt_translator.transcribe`.
+        whisper_model: Model size to use when ``transcribe`` kicks in.
 
     Returns:
         The :class:`TranslationResult`.
 
     Raises:
-        TranscriptError: If no transcript can be fetched.
+        TranscriptError: If no transcript can be fetched (and, if
+            ``transcribe`` was set, transcription also failed).
         UnknownLanguageError: If ``target`` is not a supported language.
     """
-    transcript = fetch_transcript(url_or_id, preferred=source)
+    try:
+        transcript = fetch_transcript(url_or_id, preferred=source)
+    except TranscriptError:
+        if not transcribe:
+            raise
+        from .transcribe import transcribe_video as _transcribe_video
+
+        transcript = _transcribe_video(url_or_id, model_size=whisper_model, language=source)
     return translate_transcript(
         transcript, target, provider=provider, on_progress=on_progress
     )

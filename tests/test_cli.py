@@ -22,7 +22,10 @@ runner = CliRunner()
 def stub_pipeline(monkeypatch):
     """Replace the network-bound pipeline with a deterministic stub."""
 
-    def fake_translate(video, target, source=None, provider=None, on_progress=None):
+    def fake_translate(
+        video, target, source=None, provider=None, on_progress=None,
+        transcribe=False, whisper_model="small",
+    ):
         if on_progress:
             on_progress(1, 1)
         return TranslationResult(
@@ -166,6 +169,73 @@ class TestInfoCommands:
         result = runner.invoke(cli.app, ["--help"])
         assert result.exit_code == 0
         assert "European" in result.stdout
+
+
+class TestTranscribeFlag:
+    """The --transcribe / --whisper-model opt-in fallback."""
+
+    def test_transcribe_flag_defaults_to_false(self, monkeypatch) -> None:
+        captured = {}
+
+        def fake_translate(video, target, source=None, provider=None, on_progress=None,
+                            transcribe=False, whisper_model="small"):
+            captured["transcribe"] = transcribe
+            if on_progress:
+                on_progress(1, 1)
+            return TranslationResult(
+                video_id="dQw4w9WgXcQ", source_language="en", target_language=target,
+                segments=(Segment(0.0, 1.0, "hi"),), provider="fake",
+            )
+
+        monkeypatch.setattr(cli, "translate_video", fake_translate)
+        runner.invoke(cli.app, ["url", "dQw4w9WgXcQ", "--to", "de"])
+        assert captured["transcribe"] is False
+
+    def test_transcribe_flag_is_forwarded_when_set(self, monkeypatch) -> None:
+        captured = {}
+
+        def fake_translate(video, target, source=None, provider=None, on_progress=None,
+                            transcribe=False, whisper_model="small"):
+            captured["transcribe"] = transcribe
+            captured["whisper_model"] = whisper_model
+            if on_progress:
+                on_progress(1, 1)
+            return TranslationResult(
+                video_id="dQw4w9WgXcQ", source_language="ml", target_language=target,
+                segments=(Segment(0.0, 1.0, "hi"),), provider="fake",
+            )
+
+        monkeypatch.setattr(cli, "translate_video", fake_translate)
+        result = runner.invoke(
+            cli.app,
+            ["url", "dQw4w9WgXcQ", "--to", "de", "--transcribe", "--whisper-model", "medium"],
+        )
+        assert result.exit_code == 0
+        assert captured["transcribe"] is True
+        assert captured["whisper_model"] == "medium"
+
+    def test_rejects_an_unknown_whisper_model(self) -> None:
+        result = runner.invoke(
+            cli.app, ["url", "dQw4w9WgXcQ", "--to", "de", "--transcribe", "--whisper-model", "huge"]
+        )
+        assert result.exit_code == 1
+        assert "Unknown Whisper model" in result.output
+
+    def test_a_missing_asr_extra_is_reported_cleanly(self, monkeypatch) -> None:
+        """Regression: Rich once silently ate '[asr]' as a fake style tag."""
+        from yt_translator.transcribe import TranscriptionError
+
+        def no_asr(*a, **k):
+            raise TranscriptionError(
+                "Audio transcription needs the optional 'asr' extra and ffmpeg. "
+                "Install with: uv pip install -e '.[asr]'"
+            )
+
+        monkeypatch.setattr(cli, "translate_video", no_asr)
+        result = runner.invoke(cli.app, ["url", "dQw4w9WgXcQ", "--to", "de", "--transcribe"])
+        assert result.exit_code == 1
+        assert ".[asr]" in result.output, "square brackets must survive Rich rendering"
+        assert "Traceback" not in result.output
 
 
 class TestCostSafety:

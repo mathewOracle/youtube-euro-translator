@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
@@ -13,6 +14,7 @@ from .languages import UnknownLanguageError, all_languages, resolve
 from .pipeline import translate_video
 from .providers import TranslationError, available_providers, get_translator
 from .renderers import RENDERERS, render
+from .transcribe import AVAILABLE_MODELS, DEFAULT_MODEL
 from .transcript import TranscriptError, list_available
 
 app = typer.Typer(
@@ -49,12 +51,26 @@ def translate_command(
     llm_base_url: str | None = typer.Option(
         None, "--llm-base-url", help="OpenAI-compatible endpoint (use localhost to stay free)."
     ),
+    transcribe: bool = typer.Option(
+        False,
+        "--transcribe",
+        help="If the video has no captions, generate them locally with Whisper instead "
+        "of failing. Free but slow, and needs 'pip install -e .\\[asr]' plus ffmpeg.",
+    ),
+    whisper_model: str = typer.Option(
+        DEFAULT_MODEL,
+        "--whisper-model",
+        help=f"Model size for --transcribe: {', '.join(AVAILABLE_MODELS)}. Bigger is slower "
+        "but meaningfully more accurate for non-English audio.",
+    ),
 ) -> None:
     """Translate a YouTube video's spoken content."""
     if fmt.lower().lstrip(".") not in RENDERERS:
         _die(f"Unknown format {fmt!r}. Choose from: {', '.join(RENDERERS)}")
     if output and len(to) > 1:
         _die("--output takes a single --to language. Use --outdir for several.")
+    if whisper_model not in AVAILABLE_MODELS:
+        _die(f"Unknown Whisper model {whisper_model!r}. Choose from: {', '.join(AVAILABLE_MODELS)}")
 
     try:
         targets = [resolve(code) for code in to]
@@ -84,7 +100,7 @@ def translate_command(
 
                 result = translate_video(
                     video, language.code, source=source, provider=engine,
-                    on_progress=advance,
+                    on_progress=advance, transcribe=transcribe, whisper_model=whisper_model,
                 )
         except (TranscriptError, TranslationError) as exc:
             _die(str(exc))
@@ -176,8 +192,14 @@ def _destination(
 
 
 def _die(message: str) -> None:
-    """Print an error and exit with a non-zero status."""
-    err.print(f"[red]Error:[/] {message}")
+    """Print an error and exit with a non-zero status.
+
+    Escapes the message before interpolating it into a Rich markup string:
+    error text can legitimately contain square brackets (e.g. "install
+    yt-euro-translator[asr]"), and unescaped, Rich would silently eat them
+    as fake style tags - the same trap that once corrupted translated text.
+    """
+    err.print(f"[red]Error:[/] {escape(message)}")
     raise typer.Exit(code=1)
 
 
