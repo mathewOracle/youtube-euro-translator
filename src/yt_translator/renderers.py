@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 import json
+from typing import Protocol
 
-from .models import TranslationResult
+from .models import Segment, TranslationResult
 
 __all__ = ["RENDERERS", "render", "to_json", "to_srt", "to_text", "to_vtt"]
 
 
-def to_srt(result: TranslationResult) -> str:
+class HasSegments(Protocol):
+    """Anything with timed segments: a Transcript or a TranslationResult.
+
+    Subtitle rendering needs nothing else, so accepting this protocol lets
+    the *original* transcript be rendered to SRT with the same code that
+    renders translations - no duplicated timestamp logic.
+    """
+
+    segments: tuple[Segment, ...]
+
+
+def to_srt(result: HasSegments) -> str:
     """Render SubRip (.srt) subtitles.
 
     Args:
-        result: The translated result.
+        result: Any object carrying timed ``segments`` - a
+            :class:`~yt_translator.models.TranslationResult` or a raw
+            :class:`~yt_translator.models.Transcript`.
 
     Returns:
         SRT text, ready to drop next to the video file.

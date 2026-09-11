@@ -143,6 +143,28 @@ yt-translate dub "https://youtu.be/VIDEO_ID" --to de -o dubbed.mp4 \
     --transcribe --source ml
 ```
 
+#### Original-language subtitles + choosing the voice
+
+To get a German dub with the **original Malayalam subtitles** burned in as a
+selectable track, spoken by a **male** voice:
+
+```bash
+yt-translate dub "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
+    --to de --voice male --subtitles --subtitle-language source \
+    -o malayalam-dubbed-de.mp4
+```
+
+- `--subtitles` embeds captions as a *selectable* track (toggle them in
+  VLC/QuickTime/IINA), not burned into the picture - so the Malayalam script
+  stays crisp text at any size rather than fixed-size pixels.
+- `--subtitle-language source` (the default when `--subtitles` is given)
+  embeds the **original** language. Use `target` to embed the translated
+  text instead.
+- `--voice male` / `--voice female` picks the speaking voice. All 35
+  dubbable languages have both.
+- The subtitle track is tagged with the correct ISO 639-2 code (Malayalam
+  shows up as `mal`), so players label it properly.
+
 **Read this before you rely on it.** This was verified end to end against a
 real YouTube video (download, translate, synthesize, mix, mux) and produces
 a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
@@ -150,6 +172,19 @@ a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
 - Voice synthesis is via [edge-tts](https://github.com/rany2/edge-tts) -
   free, no API key, good quality - but it is Microsoft's generic neural
   voices, not the speaker's own voice, and not lip-synced.
+- **One voice per video.** `--voice male/female` applies to the whole file.
+  It cannot detect who is speaking and switch voices per person, and it does
+  not match the original speaker's actual timbre - only their gender, and
+  only if you tell it which to use.
+- **Emotion and tone are not carried across.** This was tested, not assumed:
+  Azure's expressive `<mstts:express-as style="sad">` SSML markup is a
+  *paid* Azure Speech feature, and the free endpoint edge-tts uses simply
+  reads the XML tags out loud as literal text (a 2-second line came back as
+  33 seconds of spoken angle-brackets). Every line is therefore delivered in
+  the same neutral, friendly register regardless of whether the original was
+  shouted, whispered, or wept. Matching real expression would need a paid
+  Azure Speech key or a voice-cloning model - neither of which fits this
+  project's free-by-default rule.
 - Captions are merged into ~15-second chunks before being spoken (one clip
   per tiny caption fragment would sound absurdly choppy), so timing follows
   the original loosely, not word-for-word.

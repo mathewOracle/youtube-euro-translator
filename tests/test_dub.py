@@ -149,7 +149,8 @@ class TestDubVideoOrchestration:
             lambda chunks, clips, duration, workdir: calls.append(("mix",)) or (workdir / "a.wav"),
         )
         monkeypatch.setattr(
-            dub, "_mux", lambda video, audio, out: calls.append(("mux", str(out)))
+            dub, "_mux",
+            lambda video, audio, out, subs=None, lang=None: calls.append(("mux", str(out))),
         )
 
         out_path = tmp_path / "dubbed.mp4"
@@ -163,7 +164,7 @@ class TestDubVideoOrchestration:
         assert returned == out_path
         assert calls[0] == ("download", "dQw4w9WgXcQ")
         assert calls[-1] == ("mux", str(out_path))
-        assert any(c[0] == "synth" and c[2] == "de-DE-AmalaNeural" for c in calls)
+        assert any(c[0] == "synth" and c[2] == "de-DE-KatjaNeural" for c in calls)
         assert seen_progress == [(1, 1)], "two adjacent segments should merge into one chunk"
 
     def test_out_path_parent_directory_is_created(self, result, monkeypatch, tmp_path) -> None:
@@ -174,7 +175,7 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda chunks, clips, duration, workdir: workdir / "a.wav"
         )
-        monkeypatch.setattr(dub, "_mux", lambda video, audio, out: None)
+        monkeypatch.setattr(dub, "_mux", lambda video, audio, out, subs=None, lang=None: None)
 
         out_path = tmp_path / "nested" / "dir" / "dubbed.mp4"
         dub.dub_video(result, out_path=out_path)

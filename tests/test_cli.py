@@ -238,6 +238,38 @@ class TestTranscribeFlag:
         assert "Traceback" not in result.output
 
 
+@pytest.fixture(autouse=True)
+def stub_dub_pipeline(monkeypatch):
+    """Stub the transcript fetch used by the 'dub' command.
+
+    'dub' fetches the transcript itself (so --subtitles can reuse the
+    original text without a second download), so it needs its own stub
+    alongside the translate_video one above.
+    """
+    from yt_translator.models import Transcript
+
+    def fake_obtain(video, source=None, transcribe=False, whisper_model="small"):
+        return Transcript(
+            video_id="dQw4w9WgXcQ",
+            language=source or "en",
+            segments=(Segment(0.0, 2.0, "original text"),),
+        )
+
+    def fake_translate_transcript(transcript, target, provider=None, on_progress=None):
+        if on_progress:
+            on_progress(1, 1)
+        return TranslationResult(
+            video_id=transcript.video_id,
+            source_language=transcript.language,
+            target_language=target,
+            segments=(Segment(0.0, 2.0, f"[{target}] translated"),),
+            provider="fake",
+        )
+
+    monkeypatch.setattr(cli, "obtain_transcript", fake_obtain)
+    monkeypatch.setattr(cli, "translate_transcript", fake_translate_transcript)
+
+
 class TestDubCommand:
     """The 'dub' subcommand: translate, then hand off to the dub engine."""
 
@@ -260,11 +292,14 @@ class TestDubCommand:
 
         captured = {}
 
-        def fake_dub_video(result, *, out_path, max_chunk_seconds, on_progress=None):
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            subtitles=None, subtitle_language=None, on_progress=None):
             captured["video_id"] = result.video_id
             captured["target"] = result.target_language
             captured["out_path"] = out_path
             captured["max_chunk_seconds"] = max_chunk_seconds
+            captured["voice_gender"] = voice_gender
+            captured["subtitles"] = subtitles
             if on_progress:
                 on_progress(1, 1)
             return out_path
@@ -279,32 +314,30 @@ class TestDubCommand:
         assert captured["target"] == "de"
         assert captured["out_path"] == out_path
         assert captured["max_chunk_seconds"] == 15.0
+        assert captured["voice_gender"] == "female", "female is the documented default"
+        assert captured["subtitles"] is None, "subtitles must be opt-in"
         assert "OK" in result.output
 
     def test_forwards_transcribe_and_max_chunk_seconds(self, monkeypatch, tmp_path) -> None:
         from yt_translator import cli as cli_module
+        from yt_translator.models import Transcript
 
         translate_calls = {}
 
-        def fake_translate(video, target, source=None, provider=None, on_progress=None,
-                            transcribe=False, whisper_model="small"):
+        def fake_obtain(video, source=None, transcribe=False, whisper_model="small"):
             translate_calls["transcribe"] = transcribe
-            if on_progress:
-                on_progress(1, 1)
-            return TranslationResult(
-                video_id=video, source_language="ml", target_language=target,
-                segments=(Segment(0.0, 1.0, "hi"),), provider="fake",
-            )
+            return Transcript(video_id=video, language="ml", segments=(Segment(0.0, 1.0, "hi"),))
 
         dub_calls = {}
 
-        def fake_dub_video(result, *, out_path, max_chunk_seconds, on_progress=None):
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            subtitles=None, subtitle_language=None, on_progress=None):
             dub_calls["max_chunk_seconds"] = max_chunk_seconds
             if on_progress:
                 on_progress(1, 1)
             return out_path
 
-        monkeypatch.setattr(cli_module, "translate_video", fake_translate)
+        monkeypatch.setattr(cli_module, "obtain_transcript", fake_obtain)
         monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
 
         out_path = tmp_path / "dubbed.mp4"
@@ -316,6 +349,84 @@ class TestDubCommand:
         assert result.exit_code == 0, result.output
         assert translate_calls["transcribe"] is True
         assert dub_calls["max_chunk_seconds"] == 20.0
+
+    def test_male_voice_is_forwarded(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+
+        captured = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            subtitles=None, subtitle_language=None, on_progress=None):
+            captured["voice_gender"] = voice_gender
+            return out_path
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "o.mp4"), "--voice", "male"],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["voice_gender"] == "male"
+
+    def test_rejects_an_unknown_voice(self, tmp_path) -> None:
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "o.mp4"),
+             "--voice", "robot"],
+        )
+        assert result.exit_code == 1
+        assert "Unknown voice" in result.output
+
+    def test_subtitles_flag_passes_the_original_transcript(self, monkeypatch, tmp_path) -> None:
+        """--subtitles defaults to the ORIGINAL language, not the translation."""
+        from yt_translator import cli as cli_module
+
+        captured = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            subtitles=None, subtitle_language=None, on_progress=None):
+            captured["subtitles"] = subtitles
+            return out_path
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "o.mp4"),
+             "--subtitles", "--source", "ml"],
+        )
+        assert result.exit_code == 0, result.output
+        embedded = captured["subtitles"]
+        assert embedded is not None
+        assert embedded.language == "ml", "source subtitles must stay in the original language"
+        assert embedded.segments[0].text == "original text"
+
+    def test_subtitle_language_target_embeds_the_translation(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+
+        captured = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            subtitles=None, subtitle_language=None, on_progress=None):
+            captured["subtitles"] = subtitles
+            return out_path
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "o.mp4"),
+             "--subtitles", "--subtitle-language", "target"],
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["subtitles"].target_language == "de"
+
+    def test_rejects_an_unknown_subtitle_language_choice(self, tmp_path) -> None:
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "o.mp4"),
+             "--subtitles", "--subtitle-language", "klingon"],
+        )
+        assert result.exit_code == 1
+        assert "source" in result.output and "target" in result.output
 
     def test_a_dubbing_failure_is_reported_cleanly(self, monkeypatch, tmp_path) -> None:
         from yt_translator import cli as cli_module

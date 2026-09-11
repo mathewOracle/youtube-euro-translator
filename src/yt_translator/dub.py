@@ -28,50 +28,67 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from .models import Segment, TranslationResult
+from .models import Segment, Transcript, TranslationResult
+from .renderers import to_srt as _render_srt
 
-__all__ = ["DubbingError", "VOICE_MAP", "dub_video", "is_available"]
+__all__ = [
+    "DubbingError",
+    "GENDERS",
+    "VOICES",
+    "VOICE_MAP",
+    "dub_video",
+    "is_available",
+    "resolve_voice",
+]
 
-#: Our language code -> a real edge-tts neural voice. Built by checking
-#: `edge-tts --list-voices` against every code in languages.py; only three
-#: (eu, lb, be) currently have no neural voice at all and are omitted.
-VOICE_MAP: dict[str, str] = {
-    "en": "en-GB-LibbyNeural",
-    "ru": "ru-RU-DmitryNeural",
-    "de": "de-DE-AmalaNeural",
-    "fr": "fr-FR-DeniseNeural",
-    "it": "it-IT-DiegoNeural",
-    "es": "es-ES-AlvaroNeural",
-    "pl": "pl-PL-MarekNeural",
-    "uk": "uk-UA-OstapNeural",
-    "ro": "ro-RO-AlinaNeural",
-    "nl": "nl-NL-ColetteNeural",
-    "pt": "pt-PT-DuarteNeural",
-    "el": "el-GR-AthinaNeural",
-    "hu": "hu-HU-NoemiNeural",
-    "cs": "cs-CZ-AntoninNeural",
-    "sv": "sv-SE-MattiasNeural",
-    "bg": "bg-BG-BorislavNeural",
-    "da": "da-DK-ChristelNeural",
-    "fi": "fi-FI-HarriNeural",
-    "sk": "sk-SK-LukasNeural",
-    "no": "nb-NO-FinnNeural",  # No dedicated "no" voice; nb (Bokmal) is the closest.
-    "hr": "hr-HR-GabrijelaNeural",
-    "sr": "sr-RS-NicholasNeural",
-    "lt": "lt-LT-LeonasNeural",
-    "sl": "sl-SI-PetraNeural",
-    "lv": "lv-LV-EveritaNeural",
-    "et": "et-EE-AnuNeural",
-    "mk": "mk-MK-AleksandarNeural",
-    "sq": "sq-AL-AnilaNeural",
-    "bs": "bs-BA-GoranNeural",
-    "ca": "ca-ES-EnricNeural",
-    "ga": "ga-IE-ColmNeural",
-    "cy": "cy-GB-AledNeural",
-    "mt": "mt-MT-GraceNeural",
-    "is": "is-IS-GudrunNeural",
-    "gl": "gl-ES-RoiNeural",
+#: Our language code -> male and female edge-tts neural voices. Built by
+#: checking `edge-tts --list-voices` against every code in languages.py.
+#: Where Microsoft ships only one gender for a language, both entries point
+#: at the same voice - better a working dub in the "wrong" gender than a
+#: hard failure, and :func:`resolve_voice` says so plainly when it happens.
+VOICES: dict[str, dict[str, str]] = {
+    "en": {"female": "en-GB-LibbyNeural", "male": "en-GB-RyanNeural"},
+    "ru": {"female": "ru-RU-SvetlanaNeural", "male": "ru-RU-DmitryNeural"},
+    "de": {"female": "de-DE-KatjaNeural", "male": "de-DE-ConradNeural"},
+    "fr": {"female": "fr-FR-DeniseNeural", "male": "fr-FR-HenriNeural"},
+    "it": {"female": "it-IT-ElsaNeural", "male": "it-IT-DiegoNeural"},
+    "es": {"female": "es-ES-ElviraNeural", "male": "es-ES-AlvaroNeural"},
+    "pl": {"female": "pl-PL-ZofiaNeural", "male": "pl-PL-MarekNeural"},
+    "uk": {"female": "uk-UA-PolinaNeural", "male": "uk-UA-OstapNeural"},
+    "ro": {"female": "ro-RO-AlinaNeural", "male": "ro-RO-EmilNeural"},
+    "nl": {"female": "nl-NL-ColetteNeural", "male": "nl-NL-MaartenNeural"},
+    "pt": {"female": "pt-PT-RaquelNeural", "male": "pt-PT-DuarteNeural"},
+    "el": {"female": "el-GR-AthinaNeural", "male": "el-GR-NestorasNeural"},
+    "hu": {"female": "hu-HU-NoemiNeural", "male": "hu-HU-TamasNeural"},
+    "cs": {"female": "cs-CZ-VlastaNeural", "male": "cs-CZ-AntoninNeural"},
+    "sv": {"female": "sv-SE-SofieNeural", "male": "sv-SE-MattiasNeural"},
+    "bg": {"female": "bg-BG-KalinaNeural", "male": "bg-BG-BorislavNeural"},
+    "da": {"female": "da-DK-ChristelNeural", "male": "da-DK-JeppeNeural"},
+    "fi": {"female": "fi-FI-NooraNeural", "male": "fi-FI-HarriNeural"},
+    "sk": {"female": "sk-SK-ViktoriaNeural", "male": "sk-SK-LukasNeural"},
+    "no": {"female": "nb-NO-PernilleNeural", "male": "nb-NO-FinnNeural"},
+    "hr": {"female": "hr-HR-GabrijelaNeural", "male": "hr-HR-SreckoNeural"},
+    "sr": {"female": "sr-RS-SophieNeural", "male": "sr-RS-NicholasNeural"},
+    "lt": {"female": "lt-LT-OnaNeural", "male": "lt-LT-LeonasNeural"},
+    "sl": {"female": "sl-SI-PetraNeural", "male": "sl-SI-RokNeural"},
+    "lv": {"female": "lv-LV-EveritaNeural", "male": "lv-LV-NilsNeural"},
+    "et": {"female": "et-EE-AnuNeural", "male": "et-EE-KertNeural"},
+    "mk": {"female": "mk-MK-MarijaNeural", "male": "mk-MK-AleksandarNeural"},
+    "sq": {"female": "sq-AL-AnilaNeural", "male": "sq-AL-IlirNeural"},
+    "bs": {"female": "bs-BA-VesnaNeural", "male": "bs-BA-GoranNeural"},
+    "ca": {"female": "ca-ES-JoanaNeural", "male": "ca-ES-EnricNeural"},
+    "ga": {"female": "ga-IE-OrlaNeural", "male": "ga-IE-ColmNeural"},
+    "cy": {"female": "cy-GB-NiaNeural", "male": "cy-GB-AledNeural"},
+    "mt": {"female": "mt-MT-GraceNeural", "male": "mt-MT-JosephNeural"},
+    "is": {"female": "is-IS-GudrunNeural", "male": "is-IS-GunnarNeural"},
+    "gl": {"female": "gl-ES-SabelaNeural", "male": "gl-ES-RoiNeural"},
 }
+
+#: Backwards-compatible view: language code -> its default (female) voice.
+VOICE_MAP: dict[str, str] = {code: pair["female"] for code, pair in VOICES.items()}
+
+#: Accepted values for the ``voice_gender`` argument.
+GENDERS = ("female", "male")
 
 # ffmpeg's atempo filter only accepts a single instance in [0.5, 2.0]. We
 # never slow speech down (that sounds worse than finishing early), and cap
@@ -81,6 +98,31 @@ _MAX_TEMPO = 2.0
 
 class DubbingError(RuntimeError):
     """Raised when a video cannot be downloaded, spoken, or reassembled."""
+
+
+def resolve_voice(language_code: str, gender: str = "female") -> str:
+    """Pick the edge-tts voice for a language and speaker gender.
+
+    Args:
+        language_code: One of our supported target language codes.
+        gender: ``"female"`` or ``"male"``.
+
+    Returns:
+        The edge-tts voice name.
+
+    Raises:
+        DubbingError: If the language has no voice at all, or ``gender`` is
+            not one of :data:`GENDERS`.
+    """
+    if gender not in GENDERS:
+        raise DubbingError(f"Unknown voice gender {gender!r}. Choose from: {', '.join(GENDERS)}")
+    pair = VOICES.get(language_code)
+    if pair is None:
+        raise DubbingError(
+            f"No text-to-speech voice is available for {language_code!r}. "
+            f"Dubbing currently supports: {', '.join(sorted(VOICES))}"
+        )
+    return pair[gender]
 
 
 def is_available() -> bool:
@@ -98,6 +140,9 @@ def dub_video(
     *,
     out_path: Path,
     max_chunk_seconds: float = 15.0,
+    voice_gender: str = "female",
+    subtitles: Transcript | TranslationResult | None = None,
+    subtitle_language: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> Path:
     """Produce a local video file with synthesized speech in the target language.
@@ -110,6 +155,14 @@ def dub_video(
             this many seconds of original video time before synthesizing
             speech - one clip per tiny caption fragment would be both slow
             (hundreds of network calls) and unnaturally choppy to listen to.
+        voice_gender: ``"female"`` or ``"male"``. Applies to the whole video:
+            edge-tts speaks with one voice per request, so this cannot follow
+            individual speakers within a video.
+        subtitles: Optional captions to embed as a selectable subtitle track,
+            e.g. the original-language :class:`Transcript`. Timings are used
+            exactly as given.
+        subtitle_language: ISO code recorded on the subtitle track, so players
+            label it correctly. Defaults to the subtitles' own language.
         on_progress: Optional ``(done, total)`` callback, called once per
             synthesized chunk.
 
@@ -121,12 +174,7 @@ def dub_video(
             dependencies are missing, or any download/synthesis/ffmpeg step
             fails.
     """
-    voice = VOICE_MAP.get(result.target_language)
-    if voice is None:
-        raise DubbingError(
-            f"No text-to-speech voice is available for {result.target_language!r}. "
-            f"Dubbing currently supports: {', '.join(sorted(VOICE_MAP))}"
-        )
+    voice = resolve_voice(result.target_language, voice_gender)
     if not is_available():
         raise DubbingError(
             "Dubbing needs the optional 'dub' extra and ffmpeg. Install with: "
@@ -151,8 +199,17 @@ def dub_video(
                 on_progress(i + 1, len(chunks))
 
         audio_path = _build_dubbed_audio(chunks, clip_paths, total_duration, workdir)
+
+        subtitle_path = None
+        if subtitles is not None:
+            subtitle_path = workdir / "subtitles.srt"
+            subtitle_path.write_text(_render_srt(subtitles), encoding="utf-8")
+            subtitle_language = subtitle_language or getattr(
+                subtitles, "language", getattr(subtitles, "target_language", None)
+            )
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        _mux(video_path, audio_path, out_path)
+        _mux(video_path, audio_path, out_path, subtitle_path, subtitle_language)
 
     return out_path
 
@@ -299,8 +356,19 @@ def _build_dubbed_audio(
     return out_path
 
 
-def _mux(video_path: Path, audio_path: Path, out_path: Path) -> None:
-    """Combine ``video_path``'s video stream with ``audio_path``'s audio track.
+def _mux(
+    video_path: Path,
+    audio_path: Path,
+    out_path: Path,
+    subtitle_path: Path | None = None,
+    subtitle_language: str | None = None,
+) -> None:
+    """Combine the video stream, the dubbed audio, and optional subtitles.
+
+    Subtitles are embedded as a *selectable* mov_text track rather than
+    burned into the picture: the viewer can toggle them, and the original
+    script (Malayalam included) round-trips as UTF-8 text rather than being
+    rasterised into pixels at a fixed size.
 
     Raises:
         DubbingError: If ffmpeg fails to combine them.
@@ -308,10 +376,43 @@ def _mux(video_path: Path, audio_path: Path, out_path: Path) -> None:
     command = [
         "ffmpeg", "-y",
         "-i", str(video_path), "-i", str(audio_path),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-c:a", "aac", "-shortest",
-        str(out_path),
     ]
+    if subtitle_path is not None:
+        command += ["-i", str(subtitle_path)]
+
+    command += ["-map", "0:v:0", "-map", "1:a:0"]
+    if subtitle_path is not None:
+        command += ["-map", "2:0"]
+
+    command += ["-c:v", "copy", "-c:a", "aac"]
+    if subtitle_path is not None:
+        command += ["-c:s", "mov_text"]
+        if subtitle_language:
+            # ISO 639-2/B is what the mp4 container expects for track labels.
+            command += ["-metadata:s:s:0", f"language={_iso639_2(subtitle_language)}"]
+
+    command += ["-shortest", str(out_path)]
+
     completed = subprocess.run(command, capture_output=True, text=True)
     if completed.returncode != 0:
         raise DubbingError(f"Failed to combine video and dubbed audio: {completed.stderr[-500:]}")
+
+
+#: The handful of 2-letter -> 3-letter language codes we actually emit.
+#: mp4 subtitle tracks are labelled with ISO 639-2; anything unmapped is
+#: passed through, which players treat as "undetermined" rather than failing.
+_ISO_639_2 = {
+    "ml": "mal", "en": "eng", "de": "deu", "fr": "fra", "es": "spa", "it": "ita",
+    "pt": "por", "nl": "nld", "pl": "pol", "ru": "rus", "uk": "ukr", "ro": "ron",
+    "el": "ell", "hu": "hun", "cs": "ces", "sv": "swe", "bg": "bul", "da": "dan",
+    "fi": "fin", "sk": "slk", "no": "nor", "hr": "hrv", "sr": "srp", "lt": "lit",
+    "sl": "slv", "lv": "lav", "et": "est", "mk": "mkd", "sq": "sqi", "bs": "bos",
+    "ca": "cat", "ga": "gle", "cy": "cym", "mt": "mlt", "is": "isl", "eu": "eus",
+    "gl": "glg", "lb": "ltz", "be": "bel", "hi": "hin", "ta": "tam", "te": "tel",
+    "kn": "kan", "ar": "ara", "ja": "jpn", "zh": "zho", "ko": "kor",
+}
+
+
+def _iso639_2(code: str) -> str:
+    """Best-effort 2-letter -> 3-letter language code for mp4 track metadata."""
+    return _ISO_639_2.get(code.split("-")[0].lower(), code)

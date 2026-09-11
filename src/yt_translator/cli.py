@@ -12,7 +12,7 @@ from rich.table import Table
 
 from . import dub as dub_engine
 from .languages import UnknownLanguageError, all_languages, resolve
-from .pipeline import translate_video
+from .pipeline import obtain_transcript, translate_transcript, translate_video
 from .providers import TranslationError, available_providers, get_translator
 from .renderers import RENDERERS, render
 from .transcribe import AVAILABLE_MODELS, DEFAULT_MODEL
@@ -152,6 +152,21 @@ def dub_command(
         help="Merge captions into chunks up to this many seconds before synthesizing "
         "speech, for fewer and more natural-sounding lines than one clip per fragment.",
     ),
+    voice: str = typer.Option(
+        "female", "--voice",
+        help=f"Speaking voice for the dub: {', '.join(dub_engine.GENDERS)}. Applies to the "
+        "whole video - it cannot follow individual speakers.",
+    ),
+    subtitles: bool = typer.Option(
+        False, "--subtitles",
+        help="Embed the ORIGINAL-language captions as a selectable subtitle track "
+        "(e.g. Malayalam subtitles under a German dub).",
+    ),
+    subtitle_language: str = typer.Option(
+        "source", "--subtitle-language",
+        help="Which captions to embed with --subtitles: 'source' for the original "
+        "language, or 'target' for the translated one.",
+    ),
 ) -> None:
     """Replace a video's spoken audio with synthesized speech in another language.
 
@@ -164,15 +179,19 @@ def dub_command(
     """
     if whisper_model not in AVAILABLE_MODELS:
         _die(f"Unknown Whisper model {whisper_model!r}. Choose from: {', '.join(AVAILABLE_MODELS)}")
+    if voice not in dub_engine.GENDERS:
+        _die(f"Unknown voice {voice!r}. Choose from: {', '.join(dub_engine.GENDERS)}")
+    if subtitle_language not in ("source", "target"):
+        _die(f"--subtitle-language must be 'source' or 'target', not {subtitle_language!r}")
 
     try:
         language = resolve(to)
     except UnknownLanguageError as exc:
         _die(str(exc))
-    if language.code not in dub_engine.VOICE_MAP:
+    if language.code not in dub_engine.VOICES:
         _die(
             f"No text-to-speech voice is available for {language.name!r}. "
-            f"Dubbing currently supports: {', '.join(sorted(dub_engine.VOICE_MAP))}"
+            f"Dubbing currently supports: {', '.join(sorted(dub_engine.VOICES))}"
         )
 
     engine = _build_engine(provider, llm_model, llm_base_url)
@@ -195,11 +214,18 @@ def dub_command(
             def advance_translation(done: int, total: int, _t: int = task) -> None:
                 progress.update(_t, completed=done, total=total)
 
-            result = translate_video(
-                video, language.code, source=source, provider=engine,
-                on_progress=advance_translation, transcribe=transcribe,
-                whisper_model=whisper_model,
+            # Fetch once, use twice: the translation needs the transcript, and
+            # --subtitles may need the *original* text from that same fetch.
+            transcript = obtain_transcript(
+                video, source=source, transcribe=transcribe, whisper_model=whisper_model
             )
+            result = translate_transcript(
+                transcript, language.code, provider=engine, on_progress=advance_translation
+            )
+
+            subtitle_track = None
+            if subtitles:
+                subtitle_track = transcript if subtitle_language == "source" else result
 
             dub_task = progress.add_task("Downloading video and synthesizing speech", total=None)
 
@@ -208,6 +234,7 @@ def dub_command(
 
             dub_engine.dub_video(
                 result, out_path=output, max_chunk_seconds=max_chunk_seconds,
+                voice_gender=voice, subtitles=subtitle_track,
                 on_progress=advance_dub,
             )
     except (TranscriptError, TranslationError, dub_engine.DubbingError) as exc:
