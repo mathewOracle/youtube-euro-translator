@@ -238,6 +238,101 @@ class TestTranscribeFlag:
         assert "Traceback" not in result.output
 
 
+class TestDubCommand:
+    """The 'dub' subcommand: translate, then hand off to the dub engine."""
+
+    def test_rejects_a_language_with_no_dubbing_voice(self) -> None:
+        result = runner.invoke(
+            cli.app, ["dub", "dQw4w9WgXcQ", "--to", "eu", "-o", "/tmp/out.mp4"]
+        )
+        assert result.exit_code == 1
+        assert "No text-to-speech voice" in result.output
+
+    def test_rejects_an_unknown_language(self) -> None:
+        result = runner.invoke(
+            cli.app, ["dub", "dQw4w9WgXcQ", "--to", "klingon", "-o", "/tmp/out.mp4"]
+        )
+        assert result.exit_code == 1
+        assert "not a supported" in result.output
+
+    def test_calls_the_dub_engine_with_the_translated_result(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+
+        captured = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, on_progress=None):
+            captured["video_id"] = result.video_id
+            captured["target"] = result.target_language
+            captured["out_path"] = out_path
+            captured["max_chunk_seconds"] = max_chunk_seconds
+            if on_progress:
+                on_progress(1, 1)
+            return out_path
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+        out_path = tmp_path / "dubbed.mp4"
+        result = runner.invoke(
+            cli.app, ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(out_path)]
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["video_id"] == "dQw4w9WgXcQ"
+        assert captured["target"] == "de"
+        assert captured["out_path"] == out_path
+        assert captured["max_chunk_seconds"] == 15.0
+        assert "OK" in result.output
+
+    def test_forwards_transcribe_and_max_chunk_seconds(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+
+        translate_calls = {}
+
+        def fake_translate(video, target, source=None, provider=None, on_progress=None,
+                            transcribe=False, whisper_model="small"):
+            translate_calls["transcribe"] = transcribe
+            if on_progress:
+                on_progress(1, 1)
+            return TranslationResult(
+                video_id=video, source_language="ml", target_language=target,
+                segments=(Segment(0.0, 1.0, "hi"),), provider="fake",
+            )
+
+        dub_calls = {}
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, on_progress=None):
+            dub_calls["max_chunk_seconds"] = max_chunk_seconds
+            if on_progress:
+                on_progress(1, 1)
+            return out_path
+
+        monkeypatch.setattr(cli_module, "translate_video", fake_translate)
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+
+        out_path = tmp_path / "dubbed.mp4"
+        result = runner.invoke(
+            cli.app,
+            ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(out_path),
+             "--transcribe", "--max-chunk-seconds", "20"],
+        )
+        assert result.exit_code == 0, result.output
+        assert translate_calls["transcribe"] is True
+        assert dub_calls["max_chunk_seconds"] == 20.0
+
+    def test_a_dubbing_failure_is_reported_cleanly(self, monkeypatch, tmp_path) -> None:
+        from yt_translator import cli as cli_module
+        from yt_translator.dub import DubbingError
+
+        def broken_dub(*a, **k):
+            raise DubbingError("Could not download video for 'dQw4w9WgXcQ': boom")
+
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", broken_dub)
+        result = runner.invoke(
+            cli.app, ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "out.mp4")]
+        )
+        assert result.exit_code == 1
+        assert "boom" in result.output
+        assert "Traceback" not in result.output
+
+
 class TestCostSafety:
     """The billable backend must never engage by accident."""
 

@@ -19,6 +19,7 @@ YouTube's auto-translate is per-viewer, locked in the player, and can't be expor
 -  **38 European languages** — from Spanish and German down to Welsh, Maltese and Basque
 -  **Any source language** — the video need not be in a European language. Malayalam, Japanese, Arabic and Hindi all work; only the *target* is restricted
 -  **Generates missing captions** — `--transcribe` runs Whisper locally, for free, on videos that have no captions at all (best-effort; real captions are always better)
+-  **Full video dubbing** — `dub` replaces the spoken audio with synthesized speech in the target language and saves a local `.mp4`, for free
 -  **Free by default** — public endpoints, zero keys; the LLM backend is opt-in and refuses to start unless explicitly configured
 -  **Automatic fallback** — if one backend is blocked or rate-limited, the next takes over silently
 - ⏱ **Timings preserved** — translated subtitles stay in sync with the video
@@ -125,6 +126,44 @@ It is still free - Whisper runs entirely on your own CPU, no API key, no
 per-minute billing - just slower and less reliable than captions someone
 already wrote.
 
+### Full video dubbing: `dub`
+
+Want an actual video file where the spoken audio is in another language,
+instead of subtitles? `dub` downloads the video, translates its captions,
+speaks the translation with a free neural voice, and saves the result:
+
+```bash
+uv pip install -e ".[dub]"
+brew install ffmpeg
+
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de -o dubbed.mp4
+
+# Works with everything above too - a no-caption video via Whisper first:
+yt-translate dub "https://youtu.be/VIDEO_ID" --to de -o dubbed.mp4 \
+    --transcribe --source ml
+```
+
+**Read this before you rely on it.** This was verified end to end against a
+real YouTube video (download, translate, synthesize, mix, mux) and produces
+a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
+
+- Voice synthesis is via [edge-tts](https://github.com/rany2/edge-tts) -
+  free, no API key, good quality - but it is Microsoft's generic neural
+  voices, not the speaker's own voice, and not lip-synced.
+- Captions are merged into ~15-second chunks before being spoken (one clip
+  per tiny caption fragment would sound absurdly choppy), so timing follows
+  the original loosely, not word-for-word.
+- If a chunk's translation takes longer to say than the original line, the
+  speech is sped up to fit - capped at 2x, so it never turns into a
+  chipmunk, but a dramatically longer translation can still drift out of
+  sync with on-screen action from that point onward.
+- Only 35 of the 38 supported languages have a dubbing voice today -
+  Basque, Luxembourgish and Belarusian do not (Microsoft has no neural voice
+  for them yet). `yt-translate dub` tells you plainly if you pick one of
+  these; translating to text still works fine for all 38.
+
+Think of it as a solid first draft, not a broadcast-ready dub.
+
 ### Web UI
 
 ```bash
@@ -185,6 +224,8 @@ ruff check src      # lint
 ```
 
 To work on the speech-to-text fallback itself: `uv pip install -e ".[dev,asr]"` and `brew install ffmpeg`.
+
+To work on dubbing itself: `uv pip install -e ".[dev,dub]"` and `brew install ffmpeg`.
 
 ## Language support
 
