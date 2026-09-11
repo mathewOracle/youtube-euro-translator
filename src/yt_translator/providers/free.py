@@ -11,7 +11,7 @@ import html
 import requests
 from bs4 import BeautifulSoup
 
-from ..languages import resolve
+from ..languages import UnknownLanguageError, resolve
 from .base import TranslationError, Translator
 
 __all__ = ["GoogleWebTranslator", "MyMemoryTranslator"]
@@ -50,7 +50,7 @@ class GoogleWebTranslator(Translator):
                 f"Text of {len(text)} chars exceeds the {self._MAX_CHARS}-char limit."
             )
         params = {
-            "sl": source if source != "auto" else "auto",
+            "sl": _source_code(source),
             "tl": resolve(target).code,
             "q": text,
         }
@@ -98,7 +98,7 @@ class MyMemoryTranslator(Translator):
             return " ".join(self.translate(p, target, source) for p in parts)
 
         # MyMemory has no auto-detect, so assume English when unspecified.
-        src = resolve(source).locale if source != "auto" else "en-GB"
+        src = _source_locale(source)
         params = {"q": text, "langpair": f"{src}|{resolve(target).locale}"}
 
         try:
@@ -117,6 +117,32 @@ class MyMemoryTranslator(Translator):
         if not translated:
             raise TranslationError("MyMemory returned an empty translation.")
         return html.unescape(translated)
+
+
+def _source_code(source: str) -> str:
+    """Normalise a source language code for the Google endpoint.
+
+    The language registry lists *targets* (European languages), but a video's
+    source language can be anything - Malayalam, Japanese, Arabic. Unrecognised
+    codes are therefore passed straight through rather than rejected.
+    """
+    if source in ("auto", ""):
+        return "auto"
+    return source.split("-")[0]
+
+
+def _source_locale(source: str) -> str:
+    """Normalise a source language for MyMemory's ``langpair`` parameter.
+
+    Prefers the registry's region-qualified locale for European languages,
+    but accepts any other code verbatim so non-European sources still work.
+    """
+    if source in ("auto", ""):
+        return "en-GB"  # MyMemory cannot auto-detect.
+    try:
+        return resolve(source).locale
+    except UnknownLanguageError:
+        return source  # Non-European source: MyMemory accepts a bare code.
 
 
 def _split_sentences(text: str, limit: int) -> list[str]:

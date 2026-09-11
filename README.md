@@ -17,6 +17,7 @@ YouTube's auto-translate is per-viewer, locked in the player, and can't be expor
 ## Features
 
 -  **38 European languages** — from Spanish and German down to Welsh, Maltese and Basque
+-  **Any source language** — the video need not be in a European language. Malayalam, Japanese, Arabic and Hindi all work; only the *target* is restricted
 -  **Free by default** — public endpoints, zero keys; the LLM backend is opt-in and refuses to start unless explicitly configured
 -  **Automatic fallback** — if one backend is blocked or rate-limited, the next takes over silently
 - ⏱ **Timings preserved** — translated subtitles stay in sync with the video
@@ -44,6 +45,9 @@ yt-translate url "https://youtu.be/VIDEO_ID" --to de --format srt -o subs.srt
 
 # Plain prose to your terminal
 yt-translate url "https://youtu.be/VIDEO_ID" --to french
+
+# Source need not be European: a Malayalam video with German subtitles
+yt-translate url "https://youtu.be/gcSY3MuTaAY" --to de --format srt -o de.srt
 
 # Translate one video into several languages at once
 yt-translate url "https://youtu.be/VIDEO_ID" --to es --to it --to pl --outdir ./subs
@@ -94,6 +98,8 @@ yt-translate url "..." --to de --provider llm \
 ## Requirements
 
 The video needs **captions available** (manual or auto-generated) — that's the vast majority of YouTube. Videos with subtitles disabled by the owner can't be processed; you'll get a clear message saying so rather than a stack trace.
+
+The **source** language is unrestricted. The 38-language list below is what you can translate *into*; a Malayalam, Japanese or Arabic video translating into German works exactly the same way.
 
 ## How it works
 
