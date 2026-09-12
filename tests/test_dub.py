@@ -146,7 +146,7 @@ class TestDubVideoOrchestration:
         )
         monkeypatch.setattr(
             dub, "_build_dubbed_audio",
-            lambda chunks, clips, duration, workdir, bg=None:
+            lambda chunks, clips, duration, workdir, bg=None, gain=0.0:
                 calls.append(("mix",)) or (workdir / "a.wav"),
         )
         monkeypatch.setattr(
@@ -175,7 +175,7 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda text, voice, out_path, hint=None: None)
         monkeypatch.setattr(
             dub, "_build_dubbed_audio",
-            lambda chunks, clips, duration, workdir, bg=None: workdir / "a.wav",
+            lambda chunks, clips, duration, workdir, bg=None, gain=0.0: workdir / "a.wav",
         )
         monkeypatch.setattr(dub, "_mux", lambda video, audio, out, subs=None, lang=None: None)
 
@@ -192,11 +192,77 @@ def _stub_pipeline(monkeypatch, dub_mod, **overrides):
         "_download_source_audio": lambda v, w: w / "a.mp3",
         "_probe_duration": lambda p: 4.0,
         "_synthesize_chunk": lambda t, v, o, hint=None: None,
-        "_build_dubbed_audio": lambda c, cl, d, w, bg=None: w / "a.wav",
+        "_build_dubbed_audio": lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav",
+        "_background_gain_db": lambda bg, speech: 0.0,
         "_mux": lambda v, a, o, s=None, lang=None: None,
     }
     for name, value in {**defaults, **overrides}.items():
         monkeypatch.setattr(dub_mod, name, value)
+
+
+class TestBackgroundGain:
+    """Levelling the music to the original video's own balance.
+
+    The bug this replaced: a fixed -8 dB duck ignored how loud the music
+    actually was, so on a real Short the music ended up 5.3 dB quieter
+    relative to speech than in the source, and users heard it as suppressed.
+    """
+
+    def test_a_prominent_soundtrack_stays_prominent(self, monkeypatch, tmp_path) -> None:
+        # Music 5dB under speech in the original: it should stay 5dB under.
+        monkeypatch.setattr(
+            "yt_translator.background.measure_balance", lambda bg, speech: -5.0
+        )
+        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -30.0)
+        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
+        # Target = TTS level (-22) + balance (-5) = -27 dBFS, from -30 => +3 dB
+        assert gain == pytest.approx(3.0, abs=0.1)
+
+    def test_a_quiet_soundtrack_stays_quiet(self, monkeypatch, tmp_path) -> None:
+        """Matching the original means not inventing loudness either."""
+        monkeypatch.setattr(
+            "yt_translator.background.measure_balance", lambda bg, speech: -25.0
+        )
+        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -30.0)
+        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
+        assert gain < 0, "a barely-there soundtrack should be pushed down, not up"
+
+    def test_boosting_is_capped(self, monkeypatch, tmp_path) -> None:
+        """A near-silent bed must not be amplified into hiss."""
+        monkeypatch.setattr(
+            "yt_translator.background.measure_balance", lambda bg, speech: 0.0
+        )
+        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -90.0)
+        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
+        assert gain == dub._MAX_BACKGROUND_GAIN_DB
+
+    def test_attenuation_is_floored(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(
+            "yt_translator.background.measure_balance", lambda bg, speech: -60.0
+        )
+        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -10.0)
+        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
+        assert gain == dub._MIN_BACKGROUND_GAIN_DB
+
+    def test_an_unmeasurable_background_is_left_alone(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(
+            "yt_translator.background.measure_balance", lambda bg, speech: -10.0
+        )
+        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: None)
+        assert dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav") == 0.0
+
+    def test_the_gain_reaches_the_mixer(self, result, monkeypatch, tmp_path) -> None:
+        seen = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            _split_background=lambda audio, w, speech: (w / "background.wav", speech),
+            _background_gain_db=lambda bg, speech: 4.5,
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+                seen.setdefault("gain", gain) or (w / "a.wav")
+            ),
+        )
+        dub.dub_video(result, out_path=tmp_path / "out.mp4", keep_background=True)
+        assert seen["gain"] == 4.5
 
 
 class TestKeepBackground:
@@ -206,8 +272,9 @@ class TestKeepBackground:
         seen = {}
         _stub_pipeline(
             monkeypatch, dub,
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
-                seen.setdefault("bg", bg) or (w / "a.wav"),
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+                seen.setdefault("bg", bg) or (w / "a.wav")
+            ),
         )
         dub.dub_video(result, out_path=tmp_path / "out.mp4")
         assert seen["bg"] is None, "the default dub must not attempt separation"
@@ -217,8 +284,9 @@ class TestKeepBackground:
         _stub_pipeline(
             monkeypatch, dub,
             _split_background=lambda audio, w, speech: (w / "background.wav", speech),
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
-                seen.setdefault("bg", bg) or (w / "a.wav"),
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+                seen.setdefault("bg", bg) or (w / "a.wav")
+            ),
         )
         dub.dub_video(result, out_path=tmp_path / "out.mp4", keep_background=True)
         assert seen["bg"] is not None
@@ -237,8 +305,9 @@ class TestKeepBackground:
         seen = {}
         _stub_pipeline(
             monkeypatch, dub,
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None:
-                seen.setdefault("bg", bg) or (w / "a.wav"),
+            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+                seen.setdefault("bg", bg) or (w / "a.wav")
+            ),
         )
         dub.dub_video(result, out_path=tmp_path / "out.mp4", keep_background=True)
         assert seen["bg"] is None, "failed separation should degrade, not raise"
@@ -314,7 +383,9 @@ class TestMatchTone:
         )
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: None)
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
+        monkeypatch.setattr(
+            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+        )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4")
@@ -331,14 +402,16 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 200.0)
         monkeypatch.setattr(
             dub, "analyse_segments",
-            lambda audio, chunks, baseline, shift=0: [ProsodyHint(pitch_hz=15, rate_percent=7)]
-            * len(chunks),
+            lambda audio, chunks, baseline, shift=0, register=None:
+                [ProsodyHint(pitch_hz=15, rate_percent=7)] * len(chunks),
         )
         monkeypatch.setattr(
             dub, "_synthesize_chunk",
             lambda t, v, o, hint=None: seen_hints.append(hint),
         )
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
+        monkeypatch.setattr(
+            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+        )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
@@ -358,10 +431,13 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 0.0)
         monkeypatch.setattr(
             dub, "analyse_segments",
-            lambda audio, chunks, baseline, shift=0: [ProsodyHint()] * len(chunks),
+            lambda audio, chunks, baseline, shift=0, register=None:
+                [ProsodyHint()] * len(chunks),
         )
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: seen.append(hint))
-        monkeypatch.setattr(dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None: w / "a.wav")
+        monkeypatch.setattr(
+            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+        )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)

@@ -21,6 +21,60 @@ from yt_translator import background
 from yt_translator.background import BackgroundError
 
 
+class TestMeasureBalance:
+    """How loud the music sat against the speech in the original.
+
+    Reproducing the source's own ratio is what keeps a dub sounding like the
+    original video. A fixed duck cannot: on a real Short the music sat -12.8
+    dB under the speech, but a flat -8 dB attenuation of an already-quiet bed
+    left it 5.3 dB quieter than it should have been.
+    """
+
+    def test_quiet_music_under_loud_speech_is_negative(self, monkeypatch, tmp_path) -> None:
+        levels = {"bg.wav": -32.0, "vox.wav": -19.0}
+        monkeypatch.setattr(background, "_rms_dbfs", lambda p: levels[p.name])
+        assert background.measure_balance(tmp_path / "bg.wav", tmp_path / "vox.wav") == -13.0
+
+    def test_music_louder_than_speech_is_positive(self, monkeypatch, tmp_path) -> None:
+        levels = {"bg.wav": -12.0, "vox.wav": -20.0}
+        monkeypatch.setattr(background, "_rms_dbfs", lambda p: levels[p.name])
+        assert background.measure_balance(tmp_path / "bg.wav", tmp_path / "vox.wav") == 8.0
+
+    def test_silence_gives_a_neutral_balance(self, monkeypatch, tmp_path) -> None:
+        """An unmeasurable side must not produce a wild gain correction."""
+        monkeypatch.setattr(background, "_rms_dbfs", lambda p: None)
+        assert background.measure_balance(tmp_path / "bg.wav", tmp_path / "vox.wav") == 0.0
+
+    def test_a_silent_background_is_neutral(self, monkeypatch, tmp_path) -> None:
+        levels = {"bg.wav": None, "vox.wav": -20.0}
+        monkeypatch.setattr(background, "_rms_dbfs", lambda p: levels[p.name])
+        assert background.measure_balance(tmp_path / "bg.wav", tmp_path / "vox.wav") == 0.0
+
+
+class TestRmsDbfs:
+    """Loudness measurement, and its failure modes."""
+
+    def test_unreadable_files_measure_as_none(self, tmp_path) -> None:
+        assert background._rms_dbfs(tmp_path / "missing.mp3") is None
+
+    def test_digital_silence_measures_as_none(self, monkeypatch, tmp_path) -> None:
+        """Silence is -inf dBFS; None keeps that out of the arithmetic."""
+        import numpy as np
+
+        silence = np.zeros(16000, dtype=np.int16).tobytes()
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=silence, stderr=b"")
+        monkeypatch.setattr(background.subprocess, "run", lambda *a, **k: fake)
+        assert background._rms_dbfs(tmp_path / "x.wav") is None
+
+    def test_full_scale_is_about_zero_dbfs(self, monkeypatch, tmp_path) -> None:
+        import numpy as np
+
+        loud = np.full(16000, 32000, dtype=np.int16).tobytes()
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=loud, stderr=b"")
+        monkeypatch.setattr(background.subprocess, "run", lambda *a, **k: fake)
+        assert background._rms_dbfs(tmp_path / "x.wav") == pytest.approx(0.0, abs=0.5)
+
+
 class TestIsAvailable:
     """Detecting whether separation can run at all."""
 

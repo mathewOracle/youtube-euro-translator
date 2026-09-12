@@ -165,6 +165,62 @@ class TestAnalyseSegments:
         assert prosody.analyse_segments(tmp_path / "x.mp3", [], 200.0) == []
 
 
+class TestPitchConversion:
+    """Semitones convert to Hz using the service's calibrated response.
+
+    A flat 4 Hz-per-semitone constant reproduced only ~30-40% of a speaker's
+    real pitch movement, which is what made early dubs sound like they were
+    barely tracking the original.
+
+    The replacement was calibrated, not derived: asking edge-tts for a pitch
+    offset and measuring what came back showed ~9 Hz per achieved semitone
+    for the female voice and ~13 Hz for the male, with an asymmetric
+    response the textbook formula does not predict.
+    """
+
+    def test_the_male_voice_needs_more_hz_per_semitone(self) -> None:
+        """Measured, and the opposite of what the textbook formula predicts."""
+        female = prosody._to_hint(4.0, register="female")
+        male = prosody._to_hint(4.0, register="male")
+        assert male.pitch_hz > female.pitch_hz
+
+    def test_it_reproduces_real_movement_not_a_token_nudge(self) -> None:
+        """The original bug: a -4.6 semitone drop asked for only -18 Hz.
+
+        Whatever the tracking factor, a drop that large must still ask for a
+        substantial shift rather than a token one.
+        """
+        hint = prosody._to_hint(-4.6, register="female")
+        assert abs(hint.pitch_hz) >= 14
+
+    def test_tracking_is_deliberately_under_one(self) -> None:
+        """Slightly under-tracking avoids artefacts at the extremes."""
+        hint = prosody._to_hint(3.0, register="female")
+        exact = 3.0 * prosody._HZ_PER_SEMITONE_BY_REGISTER["female"]
+        assert abs(hint.pitch_hz) < exact
+
+    def test_an_unknown_register_still_works(self) -> None:
+        """Unknown voice: wrong by a little, rather than not tracking at all."""
+        hint = prosody._to_hint(4.0)
+        assert hint.pitch_hz > 0
+
+    def test_direction_is_preserved(self) -> None:
+        assert prosody._to_hint(3.0, register="female").pitch_hz > 0
+        assert prosody._to_hint(-3.0, register="female").pitch_hz < 0
+
+    def test_extremes_are_still_clamped(self) -> None:
+        assert prosody._to_hint(36.0, register="female").pitch_hz == prosody._MAX_PITCH_HZ
+        assert prosody._to_hint(-36.0, register="female").pitch_hz == -prosody._MAX_PITCH_HZ
+
+    def test_the_register_reaches_the_mapping(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(prosody, "_decode", lambda *a, **k: [1])
+        monkeypatch.setattr(prosody, "_median_f0", lambda samples: 260.0)
+        chunks = [Segment(0.0, 1.0, "x")]
+        female = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0, register="female")
+        male = prosody.analyse_segments(tmp_path / "a.mp3", chunks, 200.0, register="male")
+        assert male[0].pitch_hz > female[0].pitch_hz
+
+
 class TestRegisterMatching:
     """Choosing and shifting a voice towards the speaker's own register."""
 

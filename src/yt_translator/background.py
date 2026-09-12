@@ -19,7 +19,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-__all__ = ["BackgroundError", "extract_background", "is_available"]
+__all__ = [
+    "BackgroundError",
+    "extract_background",
+    "is_available",
+    "measure_balance",
+]
 
 # Demucs is trained at 44.1kHz stereo; feeding it anything else means it
 # resamples internally, so we may as well hand it what it wants.
@@ -43,6 +48,48 @@ def is_available() -> bool:
     except ImportError:
         return False
     return shutil.which("ffmpeg") is not None
+
+
+def measure_balance(background_path: Path, speech_path: Path) -> float:
+    """How loud the music sat against the speech, in dB, in the original.
+
+    Reproducing this ratio is what makes a dub sound like the original video
+    rather than like speech pasted over a distant radio. A fixed attenuation
+    cannot do it: the same duck that suits a loud music bed buries a quiet
+    one, and how prominent the music was is a property of the source, not a
+    constant.
+
+    Returns:
+        The music-to-speech ratio in dB (negative when music sits under
+        speech, as it usually does), or ``0.0`` if either side is silent.
+    """
+    background = _rms_dbfs(background_path)
+    speech = _rms_dbfs(speech_path)
+    if background is None or speech is None:
+        return 0.0
+    return background - speech
+
+
+def _rms_dbfs(path: Path) -> float | None:
+    """Loudness of a file in dBFS, or ``None`` if it is silent or unreadable."""
+    import numpy as np
+
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path),
+            "-ac", "1", "-ar", "16000", "-f", "s16le", "-",
+        ],
+        capture_output=True,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return None
+    samples = np.frombuffer(completed.stdout, dtype=np.int16).astype(np.float32)
+    if len(samples) == 0:
+        return None
+    rms = float(np.sqrt((samples**2).mean()))
+    if rms <= 0:
+        return None
+    return 20.0 * float(np.log10(rms / 32768.0))
 
 
 def extract_background(audio_path: Path, out_path: Path) -> Path:
@@ -104,7 +151,16 @@ def extract_background(audio_path: Path, out_path: Path) -> Path:
         if name != _VOCAL_STEM
     )
     _write(out_path, background)
+
+    # Keep the isolated speech too: callers need it to measure the original
+    # music-to-speech balance, and pitch-tracks far better than the raw mix.
+    _write(_speech_path_for(out_path), stems[model.sources.index(_VOCAL_STEM)])
     return out_path
+
+
+def _speech_path_for(background_path: Path) -> Path:
+    """Where the isolated speech is written alongside a background track."""
+    return background_path.with_name(f"{background_path.stem}_speech.wav")
 
 
 def _trust_system_certificates() -> None:

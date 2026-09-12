@@ -28,3 +28,10 @@ subs/
 .DS_Store
 .idea/
 .vscode/
+
+# Dubbed/translated media produced by the tool
+*.mp4
+*.mkv
+*.webm
+*.srt
+*.vtt

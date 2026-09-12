@@ -50,13 +50,37 @@ _HOP = 512
 _VOICED_FRACTION = 0.35
 _MIN_RMS = 300.0
 
-# Mapping measured deviation onto synthesis parameters. Deliberately gentle:
-# the point is to reintroduce variation, not to produce a cartoon. Caps keep
-# a wild measurement (or an octave error that slipped through) from making a
-# line unintelligible.
-_HZ_PER_SEMITONE = 4.0
-_MAX_PITCH_HZ = 35
+# Mapping measured deviation onto synthesis parameters.
+#
+# How many Hz a semitone is worth had to be CALIBRATED against the service
+# rather than derived. The textbook conversion (Hz = pitch x 2^(st/12))
+# assumes the voice responds proportionally to its own pitch; edge-tts does
+# not. Measuring what actually comes back for a given request:
+#
+#   de-DE-Katja  (female): ~9 Hz per achieved semitone
+#   de-DE-Conrad (male)  : ~13 Hz per achieved semitone
+#
+# and the response is asymmetric too - Conrad barely drops when asked to go
+# down (0.2x of the request) while Katja overshoots going up (1.27x). These
+# constants therefore describe the service's real behaviour, not theory.
+_HZ_PER_SEMITONE_BY_REGISTER: dict[str, float] = {"female": 9.0, "male": 13.0}
+_DEFAULT_HZ_PER_SEMITONE = 11.0
+
+_MAX_PITCH_HZ = 60
 _MAX_RATE_PERCENT = 20
+
+# How much of the speaker's measured movement to reproduce, tuned by
+# measuring finished dubs against their source rather than by theory. At
+# 0.85 a typical line swung well past the speaker's own range, which reads
+# as over-acting; 0.35 lands a typical line close to the original. Kept a
+# shade under 1:1 deliberately - a dub that slightly under-reacts sounds
+# natural, one that over-reacts sounds pantomime, and the pitch measurement
+# has its own error to absorb.
+_PITCH_TRACKING = 0.35
+
+# Rate follows pitch at a reduced weight: people genuinely do speed up when
+# animated, but tying rate too tightly to pitch makes excited lines gabble.
+_RATE_PERCENT_PER_SEMITONE = 2.0
 
 
 @dataclass(frozen=True)
@@ -154,6 +178,7 @@ def analyse_segments(
     chunks: list[Segment],
     baseline_hz: float,
     register_shift_hz: int = 0,
+    register: str | None = None,
 ) -> list[ProsodyHint]:
     """Measure each chunk's delivery against the speaker's baseline.
 
@@ -164,6 +189,8 @@ def analyse_segments(
         register_shift_hz: A constant pitch offset applied to every chunk, to
             sit the synthetic voice on the speaker's register. Per-line
             expressiveness rides on top of this.
+        register: ``"male"`` or ``"female"``, selecting the calibrated
+            pitch response measured for that voice.
 
     Returns:
         One :class:`ProsodyHint` per chunk, in the same order. Chunks whose
@@ -180,22 +207,34 @@ def analyse_segments(
         if median <= 0:
             hints.append(ProsodyHint(pitch_hz=register_shift_hz))
             continue
-        hints.append(_to_hint(_semitones(median, baseline_hz), register_shift_hz))
+        hints.append(
+            _to_hint(_semitones(median, baseline_hz), register_shift_hz, register)
+        )
     return hints
 
 
-def _to_hint(semitones: float, register_shift_hz: int = 0) -> ProsodyHint:
+def _to_hint(
+    semitones: float, register_shift_hz: int = 0, register: str | None = None
+) -> ProsodyHint:
     """Turn a pitch deviation in semitones into synthesis parameters.
 
-    Rate follows pitch at a reduced weight: people genuinely do speed up
-    when animated and slow down when subdued, but tying rate too tightly to
-    pitch makes excited lines gabble.
-
-    The register shift is added after clamping the expressive part, so
-    matching a deep voice never eats the budget for per-line expression.
+    Args:
+        semitones: How far this line sat above or below the speaker's norm.
+        register_shift_hz: Constant offset placing the voice in the
+            speaker's register. Added after the expressive part is clamped,
+            so matching a deep voice never eats the budget for per-line
+            expression.
+        register: ``"male"`` or ``"female"``, selecting the calibrated
+            Hz-per-semitone for that voice. Falls back to a middling value
+            when unknown, which is wrong by a little rather than a lot.
     """
-    expressive = _clamp(round(semitones * _HZ_PER_SEMITONE), _MAX_PITCH_HZ)
-    rate = _clamp(round(semitones * _HZ_PER_SEMITONE / 2), _MAX_RATE_PERCENT)
+    hz_per_semitone = _HZ_PER_SEMITONE_BY_REGISTER.get(
+        register or "", _DEFAULT_HZ_PER_SEMITONE
+    )
+    expressive = _clamp(
+        round(semitones * _PITCH_TRACKING * hz_per_semitone), _MAX_PITCH_HZ
+    )
+    rate = _clamp(round(semitones * _RATE_PERCENT_PER_SEMITONE), _MAX_RATE_PERCENT)
     return ProsodyHint(pitch_hz=expressive + register_shift_hz, rate_percent=rate)
 
 

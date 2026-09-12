@@ -187,6 +187,13 @@ yt-translate dub "https://youtu.be/VIDEO_ID" --to de --keep-background -o dubbed
 | `--keep-background` | **0%** | matches original soundtrack, r = **+0.90** |
 | default | 44.4% | nothing |
 
+The music is **levelled to the original's own balance**, not ducked by a
+fixed amount. The source is measured to see how far its music sat under its
+speech, and the dub reproduces that distance - so a video with a driving
+soundtrack keeps one. (An earlier fixed −8 dB duck ignored how loud the
+music actually was and left it ~5 dB quieter than the source, which sounded
+like the music had been suppressed.)
+
 Separation uses [Demucs](https://github.com/adefossez/demucs), which runs
 locally on CPU - free, no key. Costs: a few hundred MB of model on first
 run, and roughly half of real time to separate. Separation is imperfect on
@@ -250,6 +257,13 @@ baseline** (absolute pitch is meaningless across speakers - a bass and a
 soprano reading flatly differ by an octave), then mapped onto edge-tts's
 rate and pitch controls. Pure numpy and ffmpeg: no model download, no API
 key, nothing new to install.
+
+The semitone-to-Hz mapping is **calibrated against the service**, not
+derived: edge-tts's pitch response is non-linear and differs per voice
+(~9 Hz per achieved semitone for the female voices, ~13 Hz for the male),
+so the textbook formula under-shot badly - an early version reproduced only
+about a third of the speaker's real movement, which is what made dubs sound
+like they were barely tracking the original.
 
 **What it is and isn't:**
 

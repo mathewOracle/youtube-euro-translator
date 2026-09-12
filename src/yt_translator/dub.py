@@ -104,18 +104,26 @@ GENDERS = ("female", "male")
 _MAX_TEMPO = 2.0
 
 
-#: Typical natural pitch of the neural voices, by register. Measured from
-#: real synthesis (de-DE-Katja sits at 205 Hz, de-DE-Conrad at 126 Hz) and
-#: applied to every voice of that register: they cluster tightly enough that
-#: per-voice measurement would cost a synthesis round-trip for a couple of
-#: Hz. The shift this feeds is capped anyway, so small errors stay harmless.
-VOICE_PITCH_HZ: dict[str, float] = {"female": 205.0, "male": 126.0}
+#: Natural speaking pitch of the neural voices, by register, measured from
+#: real synthesis of a full sentence (de-DE-Katja 190 Hz, de-DE-Conrad
+#: 114 Hz). Applied to every voice of that register: they cluster tightly
+#: enough that per-voice measurement would cost a synthesis round-trip for a
+#: few Hz, and the shift this feeds is capped anyway.
+VOICE_PITCH_HZ: dict[str, float] = {"female": 190.0, "male": 114.0}
 
-# How far the background music sits under the dubbed speech. Speech has to
-# win clearly or the dub is useless, but pulling the bed down too far is
-# indistinguishable from deleting it. -8 dB keeps music present and audible
-# while leaving the voice plainly on top.
-_BACKGROUND_DUCK_DB = -8.0
+# Measured loudness of edge-tts speech, in dBFS. The synthesized voice is
+# consistent enough across voices and languages to treat as a constant, and
+# it is what the background gets balanced against.
+_TTS_SPEECH_DBFS = -22.0
+
+# Floor on how far the music may be pushed down relative to the dub. Only
+# reached when the original itself buried its music; normally the measured
+# balance is used as-is, so the dub keeps the intensity the source had.
+_MIN_BACKGROUND_GAIN_DB = -20.0
+
+# Ceiling on boosting a quiet bed. Keeps a near-silent or badly separated
+# background from being amplified into hiss.
+_MAX_BACKGROUND_GAIN_DB = 12.0
 
 
 class DubbingError(RuntimeError):
@@ -246,15 +254,22 @@ def dub_video(
         if (match_tone or match_voice) and speech_reference is not None:
             baseline = measure_baseline(speech_reference)
 
+            register = classify_register(baseline) if match_voice else None
             register_shift = 0
-            if match_voice:
-                register = classify_register(baseline)
-                if register is not None:
-                    voice = resolve_voice(result.target_language, register)
-                    register_shift = register_offset_hz(baseline, VOICE_PITCH_HZ[register])
+            if register is not None:
+                voice = resolve_voice(result.target_language, register)
+                register_shift = register_offset_hz(baseline, VOICE_PITCH_HZ[register])
+
+            # Semitones convert to Hz differently per voice, so the mapping
+            # needs to know which voice is actually about to speak.
+            speaking_register = register or voice_gender
 
             if match_tone:
-                hints = list(analyse_segments(speech_reference, chunks, baseline, register_shift))
+                hints = list(
+                    analyse_segments(
+                        speech_reference, chunks, baseline, register_shift, speaking_register
+                    )
+                )
             elif register_shift:
                 hints = [ProsodyHint(pitch_hz=register_shift)] * len(chunks)
 
@@ -266,8 +281,14 @@ def dub_video(
             if on_progress:
                 on_progress(i + 1, len(chunks))
 
+        # Reproduce the original's music-to-speech balance, rather than
+        # applying a fixed duck that ignores how loud the music really was.
+        background_gain_db = 0.0
+        if background_path is not None and speech_reference is not None:
+            background_gain_db = _background_gain_db(background_path, speech_reference)
+
         audio_path = _build_dubbed_audio(
-            chunks, clip_paths, total_duration, workdir, background_path
+            chunks, clip_paths, total_duration, workdir, background_path, background_gain_db
         )
 
         subtitle_path = None
@@ -311,23 +332,60 @@ def _group_for_dubbing(segments: tuple[Segment, ...], max_span: float) -> list[S
     return chunks
 
 
+def _background_gain_db(background_path: Path, speech_path: Path) -> float:
+    """Gain that reproduces the original video's music-to-speech balance.
+
+    The original mix is the only sensible reference for how loud its music
+    should be. Measure how far the music sat under the original speech, then
+    place it the same distance under the synthesized speech - so a video
+    with a driving soundtrack keeps one, and a quiet one stays quiet.
+
+    Returns:
+        A gain in dB to apply to the separated background.
+    """
+    from .background import measure_balance
+
+    balance_db = measure_balance(background_path, speech_path)
+    background_dbfs = _rms_dbfs_or(background_path, default=None)
+    if background_dbfs is None:
+        return 0.0
+
+    target_dbfs = _TTS_SPEECH_DBFS + balance_db
+    gain = target_dbfs - background_dbfs
+    return max(_MIN_BACKGROUND_GAIN_DB, min(_MAX_BACKGROUND_GAIN_DB, gain))
+
+
+def _rms_dbfs_or(path: Path, default: float | None) -> float | None:
+    """Loudness of ``path`` in dBFS, or ``default`` if it cannot be measured."""
+    from .background import _rms_dbfs
+
+    measured = _rms_dbfs(path)
+    return default if measured is None else measured
+
+
 def _split_background(
     source_audio: Path, workdir: Path, fallback_speech: Path | None
 ) -> tuple[Path | None, Path | None]:
     """Separate music from speech, for keeping the soundtrack under the dub.
 
     Returns:
-        ``(background_path, speech_path)``. Separation failing is not fatal -
-        a dub without its music is still a usable dub - so on failure this
-        returns no background and leaves the speech reference untouched.
+        ``(background_path, speech_path)``. The speech path is the isolated
+        vocal stem when separation succeeded - it both pitch-tracks better
+        than the raw mix and lets the original balance be measured.
+        Separation failing is not fatal - a dub without its music is still a
+        usable dub - so on failure this returns no background and leaves the
+        speech reference untouched.
     """
-    from .background import BackgroundError, extract_background
+    from .background import BackgroundError, _speech_path_for, extract_background
 
     try:
         background = extract_background(source_audio, workdir / "background.wav")
     except BackgroundError:
         return None, fallback_speech
-    return background, fallback_speech
+
+    isolated_speech = _speech_path_for(background)
+    speech = isolated_speech if isolated_speech.exists() else fallback_speech
+    return background, speech
 
 
 def _synthesize_chunk(
@@ -407,6 +465,7 @@ def _build_dubbed_audio(
     total_duration: float,
     workdir: Path,
     background_path: Path | None = None,
+    background_gain_db: float = 0.0,
 ) -> Path:
     """Mix synthesized clips into one audio track matching the video's timeline.
 
@@ -429,10 +488,10 @@ def _build_dubbed_audio(
 
     if background_path is not None:
         inputs += ["-i", str(background_path)]
-        # Duck the bed and force it to mono so it mixes cleanly with the
-        # mono speech clips and the mono silence base.
+        # Level the bed to match the original video's balance, and force it
+        # to mono so it mixes cleanly with the mono speech and silence base.
         filters.append(
-            f"[{next_input}:a]volume={_BACKGROUND_DUCK_DB}dB,"
+            f"[{next_input}:a]volume={background_gain_db:.2f}dB,"
             f"aformat=channel_layouts=mono[bg]"
         )
         labels.append("bg")
