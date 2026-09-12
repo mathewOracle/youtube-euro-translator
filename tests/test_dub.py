@@ -370,6 +370,137 @@ class TestBurnedSubtitles:
         assert captured["command"][0] == "/keg/bin/ffmpeg"
 
 
+class TestChunkOverlap:
+    """Dubbing chunks must not overlap, or two voices talk at once.
+
+    YouTube's rolling captions overlap by design. Carried into dubbing on a
+    real 60s video that produced 14.5 seconds of doubled speech.
+    """
+
+    def test_overlapping_captions_produce_tiled_chunks(self) -> None:
+        # Real shape from the reported video: each cue runs past the next start.
+        segments = (
+            Segment(0.00, 3.36, "a"), Segment(1.68, 4.12, "b"),
+            Segment(3.36, 6.20, "c"), Segment(5.80, 7.08, "d"),
+        )
+        chunks = dub._group_for_dubbing(segments, max_span=4.0)
+        for earlier, later in zip(chunks, chunks[1:], strict=False):
+            assert earlier.end <= later.start + 0.001
+
+    def test_no_text_is_lost_when_trimming(self) -> None:
+        segments = (
+            Segment(0.00, 5.00, "alpha"), Segment(1.00, 5.00, "beta"),
+            Segment(2.00, 5.00, "gamma"),
+        )
+        chunks = dub._group_for_dubbing(segments, max_span=1.5)
+        combined = " ".join(c.text for c in chunks)
+        for word in ("alpha", "beta", "gamma"):
+            assert word in combined
+
+    def test_start_times_are_never_moved(self) -> None:
+        """Starts are what the viewer sees; shifting them drifts the dub."""
+        segments = (Segment(0.0, 9.0, "a"), Segment(2.0, 9.0, "b"), Segment(4.0, 9.0, "c"))
+        chunks = dub._group_for_dubbing(segments, max_span=1.0)
+        assert [c.start for c in chunks] == [0.0, 2.0, 4.0]
+
+    def test_a_squeezed_chunk_keeps_a_minimum_span(self) -> None:
+        segments = (Segment(0.0, 9.0, "a"), Segment(0.05, 9.0, "b"))
+        chunks = dub._group_for_dubbing(segments, max_span=1.0)
+        assert chunks[0].duration == pytest.approx(dub._MIN_CHUNK_SECONDS)
+
+    def test_non_overlapping_captions_are_untouched(self) -> None:
+        segments = (Segment(0.0, 2.0, "a"), Segment(5.0, 2.0, "b"))
+        chunks = dub._group_for_dubbing(segments, max_span=3.0)
+        assert chunks[0].duration == pytest.approx(2.0)
+        assert chunks[1].duration == pytest.approx(2.0)
+
+
+class TestSpeakingRoom:
+    """How much time a chunk really has to speak into."""
+
+    def test_a_chunk_may_use_the_silence_after_it(self) -> None:
+        chunks = [Segment(0.0, 2.0, "a"), Segment(6.0, 2.0, "b")]
+        assert dub._speaking_room(chunks, 0, 10.0) == pytest.approx(6.0)
+
+    def test_the_last_chunk_runs_to_the_end_of_the_video(self) -> None:
+        chunks = [Segment(2.0, 1.0, "only")]
+        assert dub._speaking_room(chunks, 0, 10.0) == pytest.approx(8.0)
+
+    def test_room_is_never_less_than_the_caption_span(self) -> None:
+        """Back-to-back chunks keep their own span, never a negative one."""
+        chunks = [Segment(0.0, 5.0, "a"), Segment(5.0, 5.0, "b")]
+        assert dub._speaking_room(chunks, 0, 10.0) == pytest.approx(5.0)
+
+
+class TestSynthesizeToFit:
+    """Fitting long translations into the original's timing.
+
+    Translations run long - German needed 50% more time than Malayalam on a
+    real video despite near-identical character counts. Asking the voice to
+    speak faster produces real speech; time-stretching afterwards is a
+    signal-processing trick that turns metallic. Prefer the former.
+    """
+
+    def test_speech_that_fits_is_synthesized_once(self, monkeypatch, tmp_path) -> None:
+        calls = []
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda text, voice, out, hint=None: calls.append(hint),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 3.0)
+        dub._synthesize_to_fit("hallo", "de-DE-KatjaNeural", tmp_path / "c.mp3", None, room=10.0)
+        assert len(calls) == 1, "no need to re-speak a line that already fits"
+
+    def test_overlong_speech_is_respoken_faster(self, monkeypatch, tmp_path) -> None:
+        calls = []
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda text, voice, out, hint=None: calls.append(hint),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 12.0)
+        dub._synthesize_to_fit("hallo", "de-DE-KatjaNeural", tmp_path / "c.mp3", None, room=10.0)
+        assert len(calls) == 2, "an overlong line should be re-spoken"
+        assert calls[1].rate_percent > 0
+
+    def test_the_speaking_rate_is_capped(self, monkeypatch, tmp_path) -> None:
+        """Past a point, faster speech is unfollowable; atempo takes the rest."""
+        calls = []
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda text, voice, out, hint=None: calls.append(hint),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 100.0)
+        dub._synthesize_to_fit("hallo", "de-DE-KatjaNeural", tmp_path / "c.mp3", None, room=10.0)
+        assert calls[1].rate_percent == round((dub._MAX_NATIVE_RATE - 1.0) * 100)
+
+    def test_tone_matching_survives_the_speed_up(self, monkeypatch, tmp_path) -> None:
+        """Fitting must not discard the measured pitch of the original."""
+        from yt_translator.prosody import ProsodyHint
+
+        calls = []
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda text, voice, out, hint=None: calls.append(hint),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 12.0)
+        dub._synthesize_to_fit(
+            "hallo", "de-DE-KatjaNeural", tmp_path / "c.mp3",
+            ProsodyHint(pitch_hz=-20, rate_percent=5), room=10.0,
+        )
+        assert calls[1].pitch_hz == -20, "pitch must be preserved"
+        assert calls[1].rate_percent > 5, "rate should build on the tone hint"
+
+    def test_a_chunk_with_no_room_is_left_alone(self, monkeypatch, tmp_path) -> None:
+        calls = []
+        monkeypatch.setattr(
+            dub, "_synthesize_chunk",
+            lambda text, voice, out, hint=None: calls.append(hint),
+        )
+        monkeypatch.setattr(dub, "_probe_duration", lambda p: 5.0)
+        dub._synthesize_to_fit("hallo", "de-DE-KatjaNeural", tmp_path / "c.mp3", None, room=0.0)
+        assert len(calls) == 1
+
+
 class TestBackgroundGain:
     """Levelling the music to the original video's own balance.
 
@@ -604,7 +735,10 @@ class TestMatchTone:
             lambda audio, chunks, baseline, shift=0, register=None:
                 [ProsodyHint()] * len(chunks),
         )
-        monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: seen.append(hint))
+        monkeypatch.setattr(
+            dub, "_synthesize_to_fit",
+            lambda text, voice, out, hint, room: seen.append(hint),
+        )
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
         )
@@ -799,14 +933,57 @@ class TestBuildDubbedAudio:
             dub, "_probe_duration", lambda path: 1.0 if "0000" in path.name else 5.0
         )
 
-        chunks = [Segment(0.0, 5.0, "a"), Segment(5.0, 2.0, "b")]
-        clips = [tmp_path / "chunk_0000.mp3", tmp_path / "chunk_0001.mp3"]
+        # Chunk 2 is followed by a third, so it cannot borrow the tail of the
+        # video - it really does have only 2 seconds to speak into.
+        chunks = [Segment(0.0, 5.0, "a"), Segment(5.0, 2.0, "b"), Segment(7.0, 3.0, "c")]
+        clips = [tmp_path / f"chunk_{i:04d}.mp3" for i in range(3)]
         dub._build_dubbed_audio(chunks, clips, total_duration=10.0, workdir=tmp_path)
 
         filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
         first_stage = filter_arg.split(";")[0]
         assert "atempo" not in first_stage, "the fitting clip must not be sped up"
         assert "atempo=2.000" in filter_arg, "5s speech in a 2s window should clamp to the 2x cap"
+
+    def test_speech_may_use_the_gap_before_the_next_chunk(self, monkeypatch, tmp_path) -> None:
+        """Translations run long; silence after a chunk is room to speak into.
+
+        Compressing speech while the following seconds sit empty is what made
+        dubs sound rushed - 5 of 6 chunks were being sped up on a real video.
+        """
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
+
+        # The caption spans 2s, but nothing else speaks until t=6: 6s of room.
+        chunks = [Segment(0.0, 2.0, "a"), Segment(6.0, 2.0, "b")]
+        clips = [tmp_path / f"chunk_{i:04d}.mp3" for i in range(2)]
+        dub._build_dubbed_audio(chunks, clips, total_duration=10.0, workdir=tmp_path)
+
+        filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
+        assert "atempo" not in filter_arg.split(";")[0], "4s of speech fits in a 6s gap"
+
+    def test_the_last_chunk_may_run_to_the_end_of_the_video(self, monkeypatch, tmp_path) -> None:
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        monkeypatch.setattr(dub, "_probe_duration", lambda path: 5.0)
+
+        chunks = [Segment(2.0, 1.0, "only")]
+        dub._build_dubbed_audio(
+            chunks, [tmp_path / "chunk_0000.mp3"], total_duration=10.0, workdir=tmp_path
+        )
+
+        filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
+        assert "atempo" not in filter_arg, "5s of speech fits in the 8s remaining"
 
     def test_raises_on_ffmpeg_failure(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(dub, "_probe_duration", lambda path: 1.0)

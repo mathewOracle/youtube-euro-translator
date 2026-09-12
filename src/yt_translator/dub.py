@@ -101,7 +101,21 @@ GENDERS = ("female", "male")
 # ffmpeg's atempo filter only accepts a single instance in [0.5, 2.0]. We
 # never slow speech down (that sounds worse than finishing early), and cap
 # the speed-up rather than chaining atempo filters for a niche extra case.
+# Ceiling on how far a chunk may be compressed to fit its slot. Beyond
+# this, speech stops being followable regardless of how it is compressed.
 _MAX_TEMPO = 2.0
+
+# Compression up to this much is done by re-synthesizing the line at a
+# faster speaking rate, which is real speech and sounds natural. Past it,
+# ffmpeg's atempo takes over the remainder: re-synthesis alone at extreme
+# rates is hard to follow, and mixing the two spreads the damage.
+# Measured: edge-tts's rate= tracks requested compression almost exactly
+# (+50% asked, 1.50x delivered), so this is a reliable budget.
+_MAX_NATIVE_RATE = 1.35
+
+# Leave a sliver of headroom when fitting speech to its slot, so rounding
+# and codec padding cannot make a clip overrun the next one.
+_FIT_SAFETY = 0.98
 
 
 #: Natural speaking pitch of the neural voices, by register, measured from
@@ -294,7 +308,10 @@ def dub_video(
         clip_paths = []
         for i, chunk in enumerate(chunks):
             clip_path = workdir / f"chunk_{i:04d}.mp3"
-            _synthesize_chunk(chunk.text, voice, clip_path, hints[i])
+            _synthesize_to_fit(
+                chunk.text, voice, clip_path, hints[i],
+                room=_speaking_room(chunks, i, total_duration),
+            )
             clip_paths.append(clip_path)
             if on_progress:
                 on_progress(i + 1, len(chunks))
@@ -325,12 +342,37 @@ def dub_video(
     return out_path
 
 
+def _speaking_room(
+    chunks: list[Segment], index: int, total_duration: float
+) -> float:
+    """Seconds a chunk may occupy before the next one must start.
+
+    A chunk's caption span is not the same as the time available to speak
+    into: if the next chunk starts later, the gap between them is silence
+    the dub can use. Translations routinely run longer than their source
+    (German into Malayalam's timings needed up to 1.5x speed-up), so
+    claiming that gap avoids compressing speech that had room all along.
+
+    The final chunk may run to the end of the video.
+    """
+    chunk = chunks[index]
+    if index + 1 < len(chunks):
+        return max(chunk.duration, chunks[index + 1].start - chunk.start)
+    return max(chunk.duration, total_duration - chunk.start)
+
+
 def _group_for_dubbing(segments: tuple[Segment, ...], max_span: float) -> list[Segment]:
     """Merge consecutive segments into coarser chunks for smoother speech.
 
     Bounded by ``max_span`` seconds of the *original* video's timeline, not
     by character count - dubbing cares about how much time is available to
     speak into, not how much text there is.
+
+    The resulting chunks never overlap. YouTube's rolling auto-captions do:
+    each cue stays up while the next fades in, so a caption's stated end
+    time runs past the next one's start. Carried into dubbing that had two
+    synthesized voices talking over each other - 14.5 seconds' worth on a
+    60-second video - so each chunk is trimmed to end where the next begins.
     """
     if not segments:
         return []
@@ -349,7 +391,32 @@ def _group_for_dubbing(segments: tuple[Segment, ...], max_span: float) -> list[S
             start, end, texts = seg.start, seg.end, [seg.text]
 
     chunks.append(Segment(start, end - start, " ".join(texts)))
-    return chunks
+    return _without_overlap(chunks)
+
+
+def _without_overlap(chunks: list[Segment]) -> list[Segment]:
+    """Trim each chunk so it ends before the next one starts.
+
+    Only the end time moves: start times are the cue the viewer sees, and
+    shifting them would drift the dub out of sync with the picture. A chunk
+    squeezed to nothing keeps a minimum span, since the synthesized speech
+    still has to go somewhere.
+    """
+    trimmed = []
+    for index, chunk in enumerate(chunks):
+        end = chunk.end
+        if index + 1 < len(chunks):
+            next_start = chunks[index + 1].start
+            if end > next_start:
+                end = max(next_start, chunk.start + _MIN_CHUNK_SECONDS)
+        trimmed.append(Segment(chunk.start, end - chunk.start, chunk.text))
+    return trimmed
+
+
+# Floor on a trimmed chunk's span. Only reached when captions overlap so
+# heavily that trimming would leave no room at all; the speech is sped up to
+# fit (capped), which is still better than two voices at once.
+_MIN_CHUNK_SECONDS = 1.0
 
 
 def _background_gain_db(background_path: Path, speech_path: Path) -> float:
@@ -406,6 +473,45 @@ def _split_background(
     isolated_speech = _speech_path_for(background)
     speech = isolated_speech if isolated_speech.exists() else fallback_speech
     return background, speech
+
+
+def _synthesize_to_fit(
+    text: str, voice: str, out_path: Path, hint: ProsodyHint | None, room: float
+) -> None:
+    """Synthesize a chunk, re-speaking it faster if it will not fit.
+
+    Translations routinely need more time than the original - German needed
+    50% longer than Malayalam on a real video, despite almost identical
+    character counts, because the languages differ in how much meaning a
+    syllable carries. Something has to give.
+
+    Given the choice, ask the voice to *speak* faster rather than
+    time-stretching the audio afterwards: re-synthesis produces genuine
+    speech with natural prosody, while atempo is a signal-processing trick
+    that turns metallic as it is pushed. Only compression beyond what a
+    natural speaking rate can absorb is left to atempo, in
+    :func:`_build_dubbed_audio`.
+
+    Raises:
+        DubbingError: If synthesis fails or produces no audio.
+    """
+    _synthesize_chunk(text, voice, out_path, hint)
+    if room <= 0:
+        return
+
+    spoken = _probe_duration(out_path)
+    overrun = spoken / (room * _FIT_SAFETY)
+    if overrun <= 1.0:
+        return
+
+    # Re-speak at a faster rate, up to the point where speech stops sounding
+    # natural; anything still over is handled downstream by atempo.
+    rate = min(overrun, _MAX_NATIVE_RATE)
+    faster = ProsodyHint(
+        pitch_hz=hint.pitch_hz if hint else 0,
+        rate_percent=(hint.rate_percent if hint else 0) + round((rate - 1.0) * 100),
+    )
+    _synthesize_chunk(text, voice, out_path, faster)
 
 
 def _synthesize_chunk(
@@ -517,11 +623,17 @@ def _build_dubbed_audio(
         labels.append("bg")
         next_input += 1
 
-    for chunk, clip_path in zip(chunks, clip_paths, strict=True):
+    for index, (chunk, clip_path) in enumerate(zip(chunks, clip_paths, strict=True)):
         inputs += ["-i", str(clip_path)]
         clip_duration = _probe_duration(clip_path)
         delay_ms = max(0, round(chunk.start * 1000))
-        tempo = clip_duration / chunk.duration if chunk.duration > 0 else 1.0
+
+        # Speak into the gap before the next chunk, not just the caption's
+        # own span - otherwise speech is compressed while silence follows it.
+        # Most of the fitting already happened at synthesis time; atempo only
+        # covers whatever a natural speaking rate could not absorb.
+        room = _speaking_room(chunks, index, total_duration) * _FIT_SAFETY
+        tempo = clip_duration / room if room > 0 else 1.0
         tempo = min(max(tempo, 1.0), _MAX_TEMPO)
 
         stage = f"[{next_input}:a]"

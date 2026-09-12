@@ -329,9 +329,18 @@ a genuinely playable `.mp4` with a real audio track - it is not a toy. But:
   per tiny caption fragment would sound absurdly choppy), so timing follows
   the original loosely, not word-for-word.
 - If a chunk's translation takes longer to say than the original line, the
-  speech is sped up to fit - capped at 2x, so it never turns into a
-  chipmunk, but a dramatically longer translation can still drift out of
-  sync with on-screen action from that point onward.
+  voice **re-speaks it at a faster speaking rate** (up to 1.35x), which is
+  genuine speech rather than a time-stretch. Only compression beyond that is
+  handled by stretching the audio, capped at 2x total. This matters more
+  than it sounds: German needed 50% more time than Malayalam on a real
+  video, despite near-identical character counts, because languages differ
+  in how much meaning a syllable carries. A dramatically longer translation
+  can still drift from on-screen action.
+- Dubbing chunks never overlap. YouTube's rolling auto-captions do - each
+  cue stays up while the next fades in - and on a real 60-second video that
+  produced **14.5 seconds of two synthesized voices talking over each
+  other** before it was fixed. Chunks are now trimmed to tile the timeline;
+  measured speech-onset lag against the original is 0.15s.
 - Only 35 of the 38 supported languages have a dubbing voice today -
   Basque, Luxembourgish and Belarusian do not (Microsoft has no neural voice
   for them yet). `yt-translate dub` tells you plainly if you pick one of
