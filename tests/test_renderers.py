@@ -123,3 +123,59 @@ class TestEmptyInput:
         )
         assert to_vtt(empty).startswith("WEBVTT")
         assert json.loads(to_json(empty))["segments"] == []
+
+
+class TestOverlapTrimming:
+    """Rolling captions must not stack on screen.
+
+    YouTube's auto-captions overlap by design - each cue stays up while the
+    next fades in. On a real Malayalam video all 27 consecutive pairs
+    overlapped, which burned into the picture as five lines stacked at once,
+    covering the video. Trimming each cue to end where the next begins keeps
+    the reading pace but guarantees one line at a time.
+    """
+
+    @staticmethod
+    def _result(*spans):
+        return TranslationResult(
+            video_id="x", source_language="ml", target_language="de",
+            segments=[
+                Segment(start=s, duration=d, text=f"line{i}")
+                for i, (s, d) in enumerate(spans)
+            ],
+            provider="test",
+        )
+
+    def test_an_overlapping_cue_is_trimmed(self) -> None:
+        # Second cue starts at 1.68 while the first claims to run to 3.36.
+        srt = to_srt(self._result((0.0, 3.36), (1.68, 4.12)))
+        assert "00:00:00,000 --> 00:00:01,680" in srt
+
+    def test_non_overlapping_cues_are_untouched(self) -> None:
+        srt = to_srt(self._result((0.0, 2.0), (5.0, 2.0)))
+        assert "00:00:00,000 --> 00:00:02,000" in srt
+        assert "00:00:05,000 --> 00:00:07,000" in srt
+
+    def test_the_last_cue_keeps_its_full_duration(self) -> None:
+        """Nothing follows it, so there is nothing to trim against."""
+        srt = to_srt(self._result((0.0, 1.0), (2.0, 3.0)))
+        assert "00:00:02,000 --> 00:00:05,000" in srt
+
+    def test_every_cue_survives_trimming(self) -> None:
+        result = self._result((0.0, 5.0), (1.0, 5.0), (2.0, 5.0))
+        srt = to_srt(result)
+        for i in range(3):
+            assert f"line{i}" in srt
+
+    def test_a_fully_swallowed_cue_keeps_a_readable_minimum(self) -> None:
+        """Heavy overlap must not collapse a cue to zero on-screen time."""
+        srt = to_srt(self._result((0.0, 10.0), (0.05, 1.0)))
+        assert "00:00:00,000 --> 00:00:00,400" in srt
+
+    def test_vtt_trims_overlaps_too(self) -> None:
+        vtt = to_vtt(self._result((0.0, 3.36), (1.68, 4.12)))
+        assert "00:00:00.000 --> 00:00:01.680" in vtt
+
+    def test_a_single_cue_is_unchanged(self) -> None:
+        srt = to_srt(self._result((1.0, 2.5)))
+        assert "00:00:01,000 --> 00:00:03,500" in srt

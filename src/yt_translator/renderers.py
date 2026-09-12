@@ -21,8 +21,42 @@ class HasSegments(Protocol):
     segments: tuple[Segment, ...]
 
 
+def _cue_times(segments) -> list[tuple[float, float]]:
+    """Start/end times with overlaps trimmed away.
+
+    YouTube's auto-captions roll: each cue stays up while the next fades in,
+    so consecutive cues overlap by design (on one real video, all 27 pairs
+    did). A player showing one soft track at a time copes fine, but burned
+    into the picture - or in any renderer that draws every active cue - they
+    stack several lines deep and cover the video.
+
+    Trimming each cue to end where the next begins keeps the reading pace
+    identical while guaranteeing one line at a time. Cues are not reordered
+    or dropped: a cue that would collapse to nothing keeps a minimum
+    on-screen time instead.
+    """
+    times = []
+    for index, segment in enumerate(segments):
+        end = segment.end
+        if index + 1 < len(segments):
+            next_start = segments[index + 1].start
+            if end > next_start:
+                end = max(next_start, segment.start + _MIN_CUE_SECONDS)
+        times.append((segment.start, end))
+    return times
+
+
+#: Floor on a trimmed cue's on-screen time. Only reached when captions
+#: overlap so heavily that trimming would leave nothing readable; a brief
+#: flash of the right text beats a cue that never appears.
+_MIN_CUE_SECONDS = 0.4
+
+
 def to_srt(result: HasSegments) -> str:
     """Render SubRip (.srt) subtitles.
+
+    Overlapping cues are trimmed so only one shows at a time - see
+    :func:`_cue_times`.
 
     Args:
         result: Any object carrying timed ``segments`` - a
@@ -33,20 +67,27 @@ def to_srt(result: HasSegments) -> str:
         SRT text, ready to drop next to the video file.
     """
     blocks = []
-    for index, segment in enumerate(result.segments, start=1):
-        start = _timestamp(segment.start, ",")
-        end = _timestamp(segment.end, ",")
-        blocks.append(f"{index}\n{start} --> {end}\n{segment.text}")
+    times = _cue_times(result.segments)
+    for index, (segment, (start, end)) in enumerate(
+        zip(result.segments, times, strict=True), start=1
+    ):
+        blocks.append(
+            f"{index}\n{_timestamp(start, ',')} --> {_timestamp(end, ',')}\n{segment.text}"
+        )
     return "\n\n".join(blocks) + "\n"
 
 
 def to_vtt(result: TranslationResult) -> str:
-    """Render WebVTT (.vtt) subtitles, the format browsers speak natively."""
+    """Render WebVTT (.vtt) subtitles, the format browsers speak natively.
+
+    Overlapping cues are trimmed so only one shows at a time - see
+    :func:`_cue_times`.
+    """
     blocks = ["WEBVTT", ""]
-    for segment in result.segments:
-        start = _timestamp(segment.start, ".")
-        end = _timestamp(segment.end, ".")
-        blocks.append(f"{start} --> {end}\n{segment.text}\n")
+    for segment, (start, end) in zip(
+        result.segments, _cue_times(result.segments), strict=True
+    ):
+        blocks.append(f"{_timestamp(start, '.')} --> {_timestamp(end, '.')}\n{segment.text}\n")
     return "\n".join(blocks)
 
 

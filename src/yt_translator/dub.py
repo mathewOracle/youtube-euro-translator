@@ -240,10 +240,11 @@ def dub_video(
     if burn_subtitles and not supports_burned_subtitles():
         raise DubbingError(
             "This ffmpeg cannot burn subtitles: it was built without libass, so the "
-            "'subtitles' filter is missing. Either install a build that has it "
-            "(on a Mac: brew install ffmpeg --with-libass, or use the ffmpeg from "
-            "conda-forge), or drop the burn-in flag - the embedded subtitle track "
-            "works everywhere and needs no re-encode."
+            "'subtitles' filter is missing. Homebrew's default 'ffmpeg' formula "
+            "omits libass; its 'ffmpeg-full' formula includes it:\n"
+            "    brew install ffmpeg-full\n"
+            "Or drop --burn-subtitles: the embedded subtitle track works everywhere "
+            "and needs no re-encode - just switch subtitles on in your player."
         )
 
     chunks = _group_for_dubbing(result.segments, max_chunk_seconds)
@@ -546,17 +547,50 @@ def _build_dubbed_audio(
     return out_path
 
 
-def supports_burned_subtitles() -> bool:
-    """True if this ffmpeg can burn subtitles into the picture.
+#: ffmpeg builds to try for subtitle burn-in, in preference order.
+#:
+#: Homebrew ships a slim default ``ffmpeg`` without libass and a separate
+#: ``ffmpeg-full`` that has it. ffmpeg-full is *keg-only*: it is not linked
+#: into the PATH and its binary is still called ``ffmpeg``, so it can only
+#: be reached by its full keg path. Checking these means a user who has
+#: installed it need not reorder their PATH or pass anything extra.
+_FFMPEG_CANDIDATES = (
+    "ffmpeg",
+    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",  # Homebrew, Apple silicon
+    "/usr/local/opt/ffmpeg-full/bin/ffmpeg",  # Homebrew, Intel
+)
+
+
+def burn_capable_ffmpeg() -> str | None:
+    """Path to an installed ffmpeg that can burn subtitles, if any.
 
     Burning needs the ``subtitles`` filter, which requires ffmpeg to have
     been built with libass. Plenty of builds - including Homebrew's default
     - are not, so this is checked rather than assumed: the alternative is a
     render that fails minutes in, after the download and synthesis are done.
+
+    Returns:
+        An executable to invoke, or ``None`` if none can burn.
     """
+    for candidate in _FFMPEG_CANDIDATES:
+        resolved = shutil.which(candidate) or (
+            candidate if Path(candidate).is_file() else None
+        )
+        if resolved and _has_subtitles_filter(resolved):
+            return resolved
+    return None
+
+
+def supports_burned_subtitles() -> bool:
+    """True if any installed ffmpeg can burn subtitles into the picture."""
+    return burn_capable_ffmpeg() is not None
+
+
+def _has_subtitles_filter(executable: str) -> bool:
+    """True if ``executable`` exposes the libass-backed ``subtitles`` filter."""
     try:
         completed = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True
+            [executable, "-hide_banner", "-filters"], capture_output=True, text=True
         )
     except OSError:
         return False
@@ -586,7 +620,13 @@ def _mux(
     Raises:
         DubbingError: If ffmpeg fails to combine them.
     """
-    command = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path)]
+    executable = "ffmpeg"
+    if subtitle_path is not None and burn_subtitles:
+        # Burning needs a libass-enabled build, which may not be the ffmpeg
+        # first on PATH.
+        executable = burn_capable_ffmpeg() or "ffmpeg"
+
+    command = [executable, "-y", "-i", str(video_path), "-i", str(audio_path)]
 
     if subtitle_path is not None and burn_subtitles:
         # Burned-in: the subtitle is a filter input, not a muxed stream.

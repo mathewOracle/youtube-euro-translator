@@ -171,9 +171,21 @@ yt-translate dub "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
 - `--burn-subtitles` draws the text permanently into the picture instead,
   for players or upload targets that ignore soft subtitles. This re-encodes
   the video, so it is slower and slightly lossier, and it needs an ffmpeg
-  built with **libass** - many builds, including Homebrew's default, are
-  not. The tool checks up front and tells you rather than failing minutes
-  into a render.
+  built with **libass**.
+
+  Homebrew's default `ffmpeg` formula omits libass. Its `ffmpeg-full` does:
+
+  ```bash
+  brew install ffmpeg-full
+  ```
+
+  `ffmpeg-full` is keg-only (not on your `PATH`, and its binary is still
+  called `ffmpeg`), so the tool looks for it by its keg path automatically -
+  you do not need to change your `PATH`. If no capable build is found, it
+  says so up front rather than failing minutes into a render.
+
+  Verified end to end with Malayalam: complex conjuncts render correctly
+  burned in, given a font that covers the script.
 - `--subtitle-language source` (the default when `--subtitles` is given)
   embeds the **original** language. Use `target` to embed the translated
   text instead.

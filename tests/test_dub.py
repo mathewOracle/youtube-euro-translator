@@ -303,6 +303,7 @@ class TestBurnedSubtitles:
 
     def test_the_check_detects_a_missing_filter(self, monkeypatch) -> None:
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="scale\ncrop\n", stderr="")
+        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
         assert dub.supports_burned_subtitles() is False
 
@@ -310,6 +311,7 @@ class TestBurnedSubtitles:
         fake = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="... T.. subtitles         V->V ...\n", stderr=""
         )
+        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
         assert dub.supports_burned_subtitles() is True
 
@@ -317,8 +319,55 @@ class TestBurnedSubtitles:
         def boom(*a, **k):
             raise OSError("ffmpeg not found")
 
+        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.setattr(dub.subprocess, "run", boom)
         assert dub.supports_burned_subtitles() is False
+
+    def test_a_capable_keg_build_is_found(self, monkeypatch) -> None:
+        """Homebrew's ffmpeg-full is keg-only and not on the PATH.
+
+        Its binary is still called 'ffmpeg', reachable only by its full keg
+        path, so finding it saves the user from reordering their PATH.
+        """
+        monkeypatch.setattr(dub.shutil, "which", lambda name: name if name == "ffmpeg" else None)
+        monkeypatch.setattr(dub.Path, "is_file", lambda self: "ffmpeg-full" in str(self))
+
+        def fake_run(command, **kwargs):
+            capable = "ffmpeg-full" in command[0]
+            return subprocess.CompletedProcess(
+                args=command, returncode=0,
+                stdout=" subtitles " if capable else "scale", stderr="",
+            )
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        assert "ffmpeg-full" in dub.burn_capable_ffmpeg()
+
+    def test_the_plain_build_is_preferred_when_capable(self, monkeypatch) -> None:
+        """No point reaching for a keg build if the default can already burn."""
+        monkeypatch.setattr(dub.shutil, "which", lambda name: name if name == "ffmpeg" else None)
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=" subtitles ", stderr="")
+        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
+        assert dub.burn_capable_ffmpeg() == "ffmpeg"
+
+    def test_no_capable_build_returns_none(self, monkeypatch) -> None:
+        monkeypatch.setattr(dub.shutil, "which", lambda name: None)
+        monkeypatch.setattr(dub.Path, "is_file", lambda self: False)
+        assert dub.burn_capable_ffmpeg() is None
+
+    def test_burning_invokes_the_capable_build(self, monkeypatch, tmp_path) -> None:
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured.setdefault("command", command)
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub, "burn_capable_ffmpeg", lambda: "/keg/bin/ffmpeg")
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        dub._mux(
+            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
+            tmp_path / "s.srt", "ml", burn_subtitles=True,
+        )
+        assert captured["command"][0] == "/keg/bin/ffmpeg"
 
 
 class TestBackgroundGain:
