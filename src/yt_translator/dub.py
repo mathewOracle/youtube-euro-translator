@@ -174,6 +174,7 @@ def dub_video(
     match_tone: bool = False,
     match_voice: bool = False,
     keep_background: bool = False,
+    burn_subtitles: bool = False,
     subtitles: Transcript | TranslationResult | None = None,
     subtitle_language: str | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -204,6 +205,10 @@ def dub_video(
             ambience under the dub, instead of replacing the whole soundtrack
             with speech over silence. Needs the optional 'background' extra
             and is slow - see :mod:`yt_translator.background`.
+        burn_subtitles: Draw the subtitles permanently into the picture
+            rather than embedding a selectable track, for players that ignore
+            soft subtitles. Re-encodes the video, so it is slower and lossier,
+            and needs an ffmpeg built with libass.
         subtitles: Optional captions to embed as a selectable subtitle track,
             e.g. the original-language :class:`Transcript`. Timings are used
             exactly as given.
@@ -228,6 +233,18 @@ def dub_video(
         )
     if not result.segments:
         raise DubbingError("Nothing to dub: the translation has no segments.")
+    if burn_subtitles and subtitles is None:
+        raise DubbingError(
+            "Burning subtitles needs subtitles to burn - pass subtitles as well."
+        )
+    if burn_subtitles and not supports_burned_subtitles():
+        raise DubbingError(
+            "This ffmpeg cannot burn subtitles: it was built without libass, so the "
+            "'subtitles' filter is missing. Either install a build that has it "
+            "(on a Mac: brew install ffmpeg --with-libass, or use the ffmpeg from "
+            "conda-forge), or drop the burn-in flag - the embedded subtitle track "
+            "works everywhere and needs no re-encode."
+        )
 
     chunks = _group_for_dubbing(result.segments, max_chunk_seconds)
     needs_source_audio = match_tone or match_voice or keep_background
@@ -300,7 +317,9 @@ def dub_video(
             )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        _mux(video_path, audio_path, out_path, subtitle_path, subtitle_language)
+        _mux(
+            video_path, audio_path, out_path, subtitle_path, subtitle_language, burn_subtitles
+        )
 
     return out_path
 
@@ -527,46 +546,119 @@ def _build_dubbed_audio(
     return out_path
 
 
+def supports_burned_subtitles() -> bool:
+    """True if this ffmpeg can burn subtitles into the picture.
+
+    Burning needs the ``subtitles`` filter, which requires ffmpeg to have
+    been built with libass. Plenty of builds - including Homebrew's default
+    - are not, so this is checked rather than assumed: the alternative is a
+    render that fails minutes in, after the download and synthesis are done.
+    """
+    try:
+        completed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0 and " subtitles " in completed.stdout
+
+
 def _mux(
     video_path: Path,
     audio_path: Path,
     out_path: Path,
     subtitle_path: Path | None = None,
     subtitle_language: str | None = None,
+    burn_subtitles: bool = False,
 ) -> None:
     """Combine the video stream, the dubbed audio, and optional subtitles.
 
-    Subtitles are embedded as a *selectable* mov_text track rather than
-    burned into the picture: the viewer can toggle them, and the original
-    script (Malayalam included) round-trips as UTF-8 text rather than being
-    rasterised into pixels at a fixed size.
+    Subtitles are embedded as a *selectable* mov_text track by default: the
+    viewer can toggle them, and the original script (Malayalam included)
+    round-trips as UTF-8 text rather than being rasterised into pixels at a
+    fixed size. The track is marked default and given a readable title, since
+    a track no player surfaces is indistinguishable from no track at all.
+
+    With ``burn_subtitles`` the text is drawn permanently into the picture
+    instead, for players and sites that ignore soft tracks entirely. That
+    requires re-encoding the video, so it is slower and lossier.
 
     Raises:
         DubbingError: If ffmpeg fails to combine them.
     """
-    command = [
-        "ffmpeg", "-y",
-        "-i", str(video_path), "-i", str(audio_path),
-    ]
-    if subtitle_path is not None:
-        command += ["-i", str(subtitle_path)]
+    command = ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path)]
 
-    command += ["-map", "0:v:0", "-map", "1:a:0"]
-    if subtitle_path is not None:
-        command += ["-map", "2:0"]
-
-    command += ["-c:v", "copy", "-c:a", "aac"]
-    if subtitle_path is not None:
-        command += ["-c:s", "mov_text"]
+    if subtitle_path is not None and burn_subtitles:
+        # Burned-in: the subtitle is a filter input, not a muxed stream.
+        command += [
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", f"subtitles={_escape_filter_path(subtitle_path)}",
+            "-c:a", "aac",
+        ]
+    elif subtitle_path is not None:
+        command += [
+            "-i", str(subtitle_path),
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
+            "-c:v", "copy", "-c:a", "aac", "-c:s", "mov_text",
+            # Mark it default and name it, so players offer it up front
+            # rather than hiding it in a submenu as "Track 1".
+            "-disposition:s:0", "default",
+        ]
         if subtitle_language:
             # ISO 639-2/B is what the mp4 container expects for track labels.
-            command += ["-metadata:s:s:0", f"language={_iso639_2(subtitle_language)}"]
+            # No title is set: MP4's tx3g subtitle tracks have nowhere to
+            # store one (verified - ffmpeg accepts -metadata title on them
+            # and silently drops it), so players label the track from its
+            # language code alone.
+            command += [
+                "-metadata:s:s:0", f"language={_iso639_2(subtitle_language)}",
+            ]
+    else:
+        command += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac"]
 
     command += ["-shortest", str(out_path)]
 
     completed = subprocess.run(command, capture_output=True, text=True)
     if completed.returncode != 0:
         raise DubbingError(f"Failed to combine video and dubbed audio: {completed.stderr[-500:]}")
+
+
+def _escape_filter_path(path: Path) -> str:
+    """Escape a path for use inside an ffmpeg filter argument.
+
+    ffmpeg's filter syntax treats ``:``, ``'`` and ``\\`` specially, so a
+    path containing them silently breaks the filter graph.
+    """
+    text = str(path)
+    for char in ("\\", "'", ":"):
+        text = text.replace(char, f"\\{char}")
+    return f"'{text}'"
+
+
+def _language_title(code: str) -> str:
+    """A human-readable language name, e.g. ``'Malayalam'``.
+
+    Used in the CLI's confirmation message. Source languages are frequently
+    outside the supported *target* list - Malayalam being the motivating
+    case - so an unknown code falls back to the code itself rather than
+    failing.
+    """
+    from .languages import UnknownLanguageError, resolve
+
+    try:
+        return resolve(code).name
+    except UnknownLanguageError:
+        return _NON_EUROPEAN_NAMES.get(code, code)
+
+
+#: Names for source languages outside the supported European target list.
+#: Only needed to label a subtitle track readably, so it stays small and
+#: covers the languages people actually dub *from*.
+_NON_EUROPEAN_NAMES = {
+    "ml": "Malayalam", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+    "kn": "Kannada", "ar": "Arabic", "ja": "Japanese", "zh": "Chinese",
+    "ko": "Korean",
+}
 
 
 #: The handful of 2-letter -> 3-letter language codes we actually emit.

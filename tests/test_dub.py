@@ -151,7 +151,8 @@ class TestDubVideoOrchestration:
         )
         monkeypatch.setattr(
             dub, "_mux",
-            lambda video, audio, out, subs=None, lang=None: calls.append(("mux", str(out))),
+            lambda video, audio, out, subs=None, lang=None, burn=False:
+                calls.append(("mux", str(out))),
         )
 
         out_path = tmp_path / "dubbed.mp4"
@@ -177,7 +178,9 @@ class TestDubVideoOrchestration:
             dub, "_build_dubbed_audio",
             lambda chunks, clips, duration, workdir, bg=None, gain=0.0: workdir / "a.wav",
         )
-        monkeypatch.setattr(dub, "_mux", lambda video, audio, out, subs=None, lang=None: None)
+        monkeypatch.setattr(
+            dub, "_mux", lambda video, audio, out, subs=None, lang=None, burn=False: None
+        )
 
         out_path = tmp_path / "nested" / "dir" / "dubbed.mp4"
         dub.dub_video(result, out_path=out_path)
@@ -194,10 +197,128 @@ def _stub_pipeline(monkeypatch, dub_mod, **overrides):
         "_synthesize_chunk": lambda t, v, o, hint=None: None,
         "_build_dubbed_audio": lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav",
         "_background_gain_db": lambda bg, speech: 0.0,
-        "_mux": lambda v, a, o, s=None, lang=None: None,
+        "_mux": lambda v, a, o, s=None, lang=None, burn=False: None,
     }
     for name, value in {**defaults, **overrides}.items():
         monkeypatch.setattr(dub_mod, name, value)
+
+
+class TestSubtitleLabelling:
+    """Making the embedded track one a player will actually surface.
+
+    The track was always correctly embedded and tagged, but carried no
+    human-readable title, so players listed it as an anonymous "Track 1" -
+    easy to miss entirely, which reads as "the subtitles didn't come".
+    """
+
+    def test_a_source_language_outside_europe_is_named(self) -> None:
+        """Malayalam is a plausible source but not a supported target."""
+        assert dub._language_title("ml") == "Malayalam"
+
+    def test_a_supported_language_uses_its_real_name(self) -> None:
+        assert dub._language_title("de") == "German"
+
+    def test_an_unknown_code_falls_back_to_the_code(self) -> None:
+        """An ugly label beats losing the subtitle track to an exception."""
+        assert dub._language_title("zz") == "zz"
+
+    def test_the_track_is_tagged_and_marked_default(self, monkeypatch, tmp_path) -> None:
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        dub._mux(
+            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
+            tmp_path / "s.srt", "ml",
+        )
+        command = " ".join(captured["command"])
+        assert "language=mal" in command
+        assert "-disposition:s:0 default" in command
+
+
+class TestBurnedSubtitles:
+    """Drawing subtitles into the picture, for players that ignore tracks."""
+
+    def test_burning_uses_a_video_filter_and_reencodes(self, monkeypatch, tmp_path) -> None:
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        dub._mux(
+            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
+            tmp_path / "s.srt", "ml", burn_subtitles=True,
+        )
+        command = " ".join(captured["command"])
+        assert "subtitles=" in command, "burning needs the subtitles filter"
+        assert "-c:v copy" not in command, "burning cannot copy the video stream"
+
+    def test_soft_subtitles_still_copy_the_video(self, monkeypatch, tmp_path) -> None:
+        """The default path must stay fast and lossless."""
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(dub.subprocess, "run", fake_run)
+        dub._mux(
+            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
+            tmp_path / "s.srt", "ml",
+        )
+        assert "-c:v" in captured["command"]
+        assert "copy" in captured["command"]
+
+    def test_paths_with_awkward_characters_are_escaped(self, tmp_path) -> None:
+        """ffmpeg filter syntax treats ':' and quotes specially."""
+        escaped = dub._escape_filter_path(Path("/tmp/a b/sub:title's.srt"))
+        assert "\\:" in escaped
+        assert "\\'" in escaped
+
+    def test_burning_without_subtitles_is_rejected_early(
+        self, result, monkeypatch, tmp_path
+    ) -> None:
+        """Fail before the download, not after minutes of synthesis."""
+        monkeypatch.setattr(dub, "is_available", lambda: True)
+        monkeypatch.setattr(dub, "supports_burned_subtitles", lambda: True)
+        with pytest.raises(dub.DubbingError, match="subtitles to burn"):
+            dub.dub_video(result, out_path=tmp_path / "o.mp4", burn_subtitles=True)
+
+    def test_an_ffmpeg_without_libass_is_reported_clearly(
+        self, result, monkeypatch, tmp_path
+    ) -> None:
+        """Many ffmpeg builds lack libass; say so instead of failing late."""
+        monkeypatch.setattr(dub, "is_available", lambda: True)
+        monkeypatch.setattr(dub, "supports_burned_subtitles", lambda: False)
+        with pytest.raises(dub.DubbingError, match="libass"):
+            dub.dub_video(
+                result, out_path=tmp_path / "o.mp4",
+                burn_subtitles=True, subtitles=result,
+            )
+
+    def test_the_check_detects_a_missing_filter(self, monkeypatch) -> None:
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="scale\ncrop\n", stderr="")
+        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
+        assert dub.supports_burned_subtitles() is False
+
+    def test_the_check_detects_a_present_filter(self, monkeypatch) -> None:
+        fake = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="... T.. subtitles         V->V ...\n", stderr=""
+        )
+        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
+        assert dub.supports_burned_subtitles() is True
+
+    def test_a_missing_ffmpeg_is_not_a_crash(self, monkeypatch) -> None:
+        def boom(*a, **k):
+            raise OSError("ffmpeg not found")
+
+        monkeypatch.setattr(dub.subprocess, "run", boom)
+        assert dub.supports_burned_subtitles() is False
 
 
 class TestBackgroundGain:
@@ -386,7 +507,7 @@ class TestMatchTone:
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
         )
-        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4")
         assert analysed == [], "source audio must not be fetched unless asked for"
@@ -412,7 +533,7 @@ class TestMatchTone:
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
         )
-        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
 
@@ -438,7 +559,7 @@ class TestMatchTone:
         monkeypatch.setattr(
             dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
         )
-        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None: None)
+        monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
         dub.dub_video(result, out_path=tmp_path / "out.mp4", match_tone=True)
         assert all(h.is_neutral for h in seen)

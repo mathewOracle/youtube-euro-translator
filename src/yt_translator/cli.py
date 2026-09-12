@@ -169,6 +169,13 @@ def dub_command(
         "pitch towards theirs, overriding --voice. Approximates their pitch; it does "
         "not clone their voice.",
     ),
+    burn_subtitles: bool = typer.Option(
+        False, "--burn-subtitles",
+        help="Draw the subtitles permanently into the picture instead of embedding a "
+        "selectable track. Use this if your player or upload target ignores soft "
+        "subtitles. Re-encodes the video (slower, slightly lossier) and needs an "
+        "ffmpeg built with libass.",
+    ),
     keep_background: bool = typer.Option(
         False, "--keep-background",
         help="Keep the original music and ambience under the dub instead of replacing "
@@ -253,13 +260,36 @@ def dub_command(
             dub_engine.dub_video(
                 result, out_path=output, max_chunk_seconds=max_chunk_seconds,
                 voice_gender=voice, match_tone=match_tone, match_voice=match_voice,
-                keep_background=keep_background, subtitles=subtitle_track,
-                on_progress=advance_dub,
+                keep_background=keep_background, burn_subtitles=burn_subtitles,
+                subtitles=subtitle_track, on_progress=advance_dub,
             )
     except (TranscriptError, TranslationError, dub_engine.DubbingError) as exc:
         _die(str(exc))
 
     err.print(f"[green]OK[/] Saved dubbed video ({language.name}) -> {output}")
+    if subtitles and subtitle_track is not None:
+        _report_subtitles(subtitle_track, burn_subtitles)
+
+
+def _report_subtitles(subtitle_track, burned: bool) -> None:
+    """Tell the user the subtitles are there, and how to see them.
+
+    A soft subtitle track is easy to miss: most players leave subtitles off
+    until asked, so a correctly embedded track is indistinguishable from a
+    missing one unless the user knows to go looking.
+    """
+    code = getattr(subtitle_track, "language", None) or getattr(
+        subtitle_track, "target_language", ""
+    )
+    name = dub_engine._language_title(code) if code else "original-language"
+    if burned:
+        err.print(f"     {name} subtitles are burned into the picture.")
+        return
+    err.print(
+        f"     {name} subtitles are embedded as a selectable track. Most players "
+        "keep subtitles off by default - turn them on in the player's subtitle menu "
+        "(QuickTime, VLC, IINA). Use --burn-subtitles to draw them in permanently."
+    )
 
 
 @app.command("captions")

@@ -156,9 +156,24 @@ yt-translate dub "https://www.youtube.com/watch?v=gcSY3MuTaAY" \
     -o malayalam-dubbed-de.mp4
 ```
 
-- `--subtitles` embeds captions as a *selectable* track (toggle them in
-  VLC/QuickTime/IINA), not burned into the picture - so the Malayalam script
-  stays crisp text at any size rather than fixed-size pixels.
+- `--subtitles` embeds captions as a *selectable* track, not burned into
+  the picture - so the Malayalam script stays crisp text at any size rather
+  than fixed-size pixels.
+
+  > **Most players keep subtitles switched off until you ask.** A selectable
+  > track is easy to mistake for a missing one. In QuickTime, VLC or IINA,
+  > open the subtitle menu and pick the track (it is labelled by its
+  > language code, e.g. `mal` for Malayalam). The CLI now says so after
+  > every dub. MP4 cannot store a friendlier track *name* - ffmpeg accepts
+  > one and silently drops it, verified - so the language code is all
+  > players have to show.
+
+- `--burn-subtitles` draws the text permanently into the picture instead,
+  for players or upload targets that ignore soft subtitles. This re-encodes
+  the video, so it is slower and slightly lossier, and it needs an ffmpeg
+  built with **libass** - many builds, including Homebrew's default, are
+  not. The tool checks up front and tells you rather than failing minutes
+  into a render.
 - `--subtitle-language source` (the default when `--subtitles` is given)
   embeds the **original** language. Use `target` to embed the translated
   text instead.
