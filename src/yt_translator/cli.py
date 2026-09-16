@@ -153,10 +153,12 @@ def dub_command(
         help="Merge captions into chunks up to this many seconds before synthesizing "
         "speech, for fewer and more natural-sounding lines than one clip per fragment.",
     ),
-    voice: str = typer.Option(
-        "female", "--voice",
+    voice: str | None = typer.Option(
+        None, "--voice",
         help=f"Speaking voice for the dub: {', '.join(dub_engine.GENDERS)}. Applies to the "
-        "whole video - it cannot follow individual speakers.",
+        "whole video - it cannot follow individual speakers. Defaults to female, unless "
+        "--match-voice picks one from the source audio's pitch. Passing --voice explicitly "
+        "always wins over --match-voice's guess.",
     ),
     match_tone: bool = typer.Option(
         False, "--match-tone",
@@ -167,8 +169,8 @@ def dub_command(
     match_voice: bool = typer.Option(
         False, "--match-voice",
         help="Pick the voice closer to the original speaker's register and shift its "
-        "pitch towards theirs, overriding --voice. Approximates their pitch; it does "
-        "not clone their voice.",
+        "pitch towards theirs, when --voice was left unspecified. Approximates their "
+        "pitch; it does not clone their voice. An explicit --voice always wins.",
     ),
     burn_subtitles: bool = typer.Option(
         False, "--burn-subtitles",
@@ -205,7 +207,7 @@ def dub_command(
     """
     if whisper_model not in AVAILABLE_MODELS:
         _die(f"Unknown Whisper model {whisper_model!r}. Choose from: {', '.join(AVAILABLE_MODELS)}")
-    if voice not in dub_engine.GENDERS:
+    if voice is not None and voice not in dub_engine.GENDERS:
         _die(f"Unknown voice {voice!r}. Choose from: {', '.join(dub_engine.GENDERS)}")
     if subtitle_language not in ("source", "target"):
         _die(f"--subtitle-language must be 'source' or 'target', not {subtitle_language!r}")
@@ -267,7 +269,8 @@ def dub_command(
 
                 dub_engine.dub_video(
                     result, out_path=output, max_chunk_seconds=max_chunk_seconds,
-                    voice_gender=voice, match_tone=match_tone, match_voice=match_voice,
+                    voice_gender=voice or "female", voice_explicit=voice is not None,
+                    match_tone=match_tone, match_voice=match_voice,
                     keep_background=keep_background, burn_subtitles=burn_subtitles,
                     subtitles=subtitle_track, on_progress=advance_dub,
                 )

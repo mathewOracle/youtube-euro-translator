@@ -293,6 +293,7 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
@@ -301,6 +302,7 @@ class TestDubCommand:
             captured["out_path"] = out_path
             captured["max_chunk_seconds"] = max_chunk_seconds
             captured["voice_gender"] = voice_gender
+            captured["voice_explicit"] = voice_explicit
             captured["subtitles"] = subtitles
             if on_progress:
                 on_progress(1, 1)
@@ -317,6 +319,7 @@ class TestDubCommand:
         assert captured["out_path"] == out_path
         assert captured["max_chunk_seconds"] == 15.0
         assert captured["voice_gender"] == "female", "female is the documented default"
+        assert captured["voice_explicit"] is False, "unset --voice must not count as explicit"
         assert captured["subtitles"] is None, "subtitles must be opt-in"
         assert "OK" in result.output
 
@@ -333,6 +336,7 @@ class TestDubCommand:
         dub_calls = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
@@ -360,10 +364,12 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
             captured["voice_gender"] = voice_gender
+            captured["voice_explicit"] = voice_explicit
             return out_path
 
         monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
@@ -373,6 +379,7 @@ class TestDubCommand:
         )
         assert result.exit_code == 0, result.output
         assert captured["voice_gender"] == "male"
+        assert captured["voice_explicit"] is True, "an explicit --voice must be marked as such"
 
     def test_match_tone_defaults_off_and_forwards_when_set(self, monkeypatch, tmp_path) -> None:
         from yt_translator import cli as cli_module
@@ -380,6 +387,7 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
@@ -414,6 +422,7 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
@@ -438,6 +447,7 @@ class TestDubCommand:
         captured = {}
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):
@@ -507,6 +517,7 @@ class TestDubCommand:
             )
 
         def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            voice_explicit=False,
                             match_tone=False, match_voice=False, keep_background=False,
                             burn_subtitles=False, subtitles=None, subtitle_language=None,
                             on_progress=None):

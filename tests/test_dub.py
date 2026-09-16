@@ -511,6 +511,26 @@ class TestMatchVoice:
         )
         assert used["voice"] == dub.VOICES["de"]["female"], "no measurement, no override"
 
+    def test_an_explicit_voice_survives_match_voice(
+        self, result, monkeypatch, tmp_path
+    ) -> None:
+        """A naturally high-pitched male speaker still measures as 'female' by
+        pitch alone (classify_register is F0-only, not real gender detection).
+        A caller who explicitly asked for --voice male should never get
+        overruled by that heuristic.
+        """
+        used = {}
+        _stub_pipeline(
+            monkeypatch, dub,
+            measure_baseline=lambda p: 220.0,  # would normally flip to female
+            _synthesize_chunk=lambda t, v, o, hint=None: used.setdefault("voice", v),
+        )
+        dub.dub_video(
+            result, out_path=tmp_path / "out.mp4",
+            voice_gender="male", voice_explicit=True, match_voice=True,
+        )
+        assert used["voice"] == dub.VOICES["de"]["male"], "explicit --voice must win"
+
 
 class TestMatchTone:
     """The --match-tone path: measure source delivery, apply it to the dub."""

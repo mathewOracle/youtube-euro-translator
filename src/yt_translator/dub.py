@@ -173,6 +173,7 @@ def dub_video(
     out_path: Path,
     max_chunk_seconds: float = 15.0,
     voice_gender: str = "female",
+    voice_explicit: bool = False,
     match_tone: bool = False,
     match_voice: bool = False,
     keep_background: bool = False,
@@ -194,6 +195,14 @@ def dub_video(
         voice_gender: ``"female"`` or ``"male"``. Applies to the whole video:
             edge-tts speaks with one voice per request, so this cannot follow
             individual speakers within a video.
+        voice_explicit: True if ``voice_gender`` was a deliberate choice (e.g.
+            the caller passed ``--voice`` on the command line) rather than a
+            leftover default. When True, it is trusted over ``match_voice``'s
+            guess - see ``match_voice`` below. Auto-detecting gender from
+            pitch alone is a rough heuristic (see
+            :func:`~yt_translator.prosody.classify_register`); a speaker who
+            explicitly says which voice they want should never be overruled
+            by it.
         match_tone: Measure how the original speaker delivered each chunk
             (pitch and pace) and carry that contour into the synthesized
             speech, instead of speaking every line in the same flat register.
@@ -202,7 +211,8 @@ def dub_video(
         match_voice: Pick the male or female voice closer to the original
             speaker's register and shift its pitch towards theirs, rather
             than using ``voice_gender`` as given. This approximates the
-            speaker's pitch; it does not clone their voice.
+            speaker's pitch; it does not clone their voice. Ignored if
+            ``voice_explicit`` is True - an explicit ``--voice`` always wins.
         keep_background: Separate the original audio and keep its music and
             ambience under the dub, instead of replacing the whole soundtrack
             with speech over silence. Needs the optional 'background' extra
@@ -274,7 +284,14 @@ def dub_video(
         if (match_tone or match_voice) and speech_reference is not None:
             baseline = measure_baseline(speech_reference)
 
-            register = classify_register(baseline) if match_voice else None
+            # An explicit --voice is a deliberate choice and always wins;
+            # match_voice's pitch-based guess only fills in when the caller
+            # left the gender unspecified. Pitch alone is a rough proxy for
+            # perceived gender (see classify_register) - a naturally
+            # high-pitched male speaker, for instance, can measure above the
+            # male/female split and get reclassified against the caller's
+            # wishes if we don't respect an explicit choice here.
+            register = classify_register(baseline) if (match_voice and not voice_explicit) else None
             register_shift = 0
             if register is not None:
                 voice = resolve_voice(result.target_language, register)
