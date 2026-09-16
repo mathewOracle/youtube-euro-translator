@@ -9,7 +9,6 @@ mocking the heavy/networked/subprocess seams, so they run fast and offline.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -145,8 +144,8 @@ class TestDubVideoOrchestration:
             lambda text, voice, out_path, hint=None: calls.append(("synth", text, voice)),
         )
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio",
-            lambda chunks, clips, duration, workdir, bg=None, gain=0.0:
+            dub, "build_dubbed_audio",
+            lambda chunks, clips, duration, workdir, rooms, bg=None, gain=0.0:
                 calls.append(("mix",)) or (workdir / "a.wav"),
         )
         monkeypatch.setattr(
@@ -175,8 +174,8 @@ class TestDubVideoOrchestration:
         monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda text, voice, out_path, hint=None: None)
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio",
-            lambda chunks, clips, duration, workdir, bg=None, gain=0.0: workdir / "a.wav",
+            dub, "build_dubbed_audio",
+            lambda chunks, clips, duration, workdir, rooms, bg=None, gain=0.0: workdir / "a.wav",
         )
         monkeypatch.setattr(
             dub, "_mux", lambda video, audio, out, subs=None, lang=None, burn=False: None
@@ -195,8 +194,8 @@ def _stub_pipeline(monkeypatch, dub_mod, **overrides):
         "_download_source_audio": lambda v, w: w / "a.mp3",
         "_probe_duration": lambda p: 4.0,
         "_synthesize_chunk": lambda t, v, o, hint=None: None,
-        "_build_dubbed_audio": lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav",
-        "_background_gain_db": lambda bg, speech: 0.0,
+        "build_dubbed_audio": lambda c, cl, d, w, rooms, bg=None, gain=0.0: w / "a.wav",
+        "background_gain_db": lambda bg, speech: 0.0,
         "_mux": lambda v, a, o, s=None, lang=None, burn=False: None,
     }
     for name, value in {**defaults, **overrides}.items():
@@ -222,63 +221,9 @@ class TestSubtitleLabelling:
         """An ugly label beats losing the subtitle track to an exception."""
         assert dub._language_title("zz") == "zz"
 
-    def test_the_track_is_tagged_and_marked_default(self, monkeypatch, tmp_path) -> None:
-        captured = {}
 
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        dub._mux(
-            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
-            tmp_path / "s.srt", "ml",
-        )
-        command = " ".join(captured["command"])
-        assert "language=mal" in command
-        assert "-disposition:s:0 default" in command
-
-
-class TestBurnedSubtitles:
-    """Drawing subtitles into the picture, for players that ignore tracks."""
-
-    def test_burning_uses_a_video_filter_and_reencodes(self, monkeypatch, tmp_path) -> None:
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        dub._mux(
-            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
-            tmp_path / "s.srt", "ml", burn_subtitles=True,
-        )
-        command = " ".join(captured["command"])
-        assert "subtitles=" in command, "burning needs the subtitles filter"
-        assert "-c:v copy" not in command, "burning cannot copy the video stream"
-
-    def test_soft_subtitles_still_copy_the_video(self, monkeypatch, tmp_path) -> None:
-        """The default path must stay fast and lossless."""
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        dub._mux(
-            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
-            tmp_path / "s.srt", "ml",
-        )
-        assert "-c:v" in captured["command"]
-        assert "copy" in captured["command"]
-
-    def test_paths_with_awkward_characters_are_escaped(self, tmp_path) -> None:
-        """ffmpeg filter syntax treats ':' and quotes specially."""
-        escaped = dub._escape_filter_path(Path("/tmp/a b/sub:title's.srt"))
-        assert "\\:" in escaped
-        assert "\\'" in escaped
+class TestBurnSubtitlesGuardClauses:
+    """dub_video's own pre-flight checks before muxing is ever reached."""
 
     def test_burning_without_subtitles_is_rejected_early(
         self, result, monkeypatch, tmp_path
@@ -300,74 +245,6 @@ class TestBurnedSubtitles:
                 result, out_path=tmp_path / "o.mp4",
                 burn_subtitles=True, subtitles=result,
             )
-
-    def test_the_check_detects_a_missing_filter(self, monkeypatch) -> None:
-        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="scale\ncrop\n", stderr="")
-        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
-        assert dub.supports_burned_subtitles() is False
-
-    def test_the_check_detects_a_present_filter(self, monkeypatch) -> None:
-        fake = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="... T.. subtitles         V->V ...\n", stderr=""
-        )
-        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
-        assert dub.supports_burned_subtitles() is True
-
-    def test_a_missing_ffmpeg_is_not_a_crash(self, monkeypatch) -> None:
-        def boom(*a, **k):
-            raise OSError("ffmpeg not found")
-
-        monkeypatch.setattr(dub.shutil, "which", lambda name: f"/usr/bin/{name}")
-        monkeypatch.setattr(dub.subprocess, "run", boom)
-        assert dub.supports_burned_subtitles() is False
-
-    def test_a_capable_keg_build_is_found(self, monkeypatch) -> None:
-        """Homebrew's ffmpeg-full is keg-only and not on the PATH.
-
-        Its binary is still called 'ffmpeg', reachable only by its full keg
-        path, so finding it saves the user from reordering their PATH.
-        """
-        monkeypatch.setattr(dub.shutil, "which", lambda name: name if name == "ffmpeg" else None)
-        monkeypatch.setattr(dub.Path, "is_file", lambda self: "ffmpeg-full" in str(self))
-
-        def fake_run(command, **kwargs):
-            capable = "ffmpeg-full" in command[0]
-            return subprocess.CompletedProcess(
-                args=command, returncode=0,
-                stdout=" subtitles " if capable else "scale", stderr="",
-            )
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        assert "ffmpeg-full" in dub.burn_capable_ffmpeg()
-
-    def test_the_plain_build_is_preferred_when_capable(self, monkeypatch) -> None:
-        """No point reaching for a keg build if the default can already burn."""
-        monkeypatch.setattr(dub.shutil, "which", lambda name: name if name == "ffmpeg" else None)
-        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=" subtitles ", stderr="")
-        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
-        assert dub.burn_capable_ffmpeg() == "ffmpeg"
-
-    def test_no_capable_build_returns_none(self, monkeypatch) -> None:
-        monkeypatch.setattr(dub.shutil, "which", lambda name: None)
-        monkeypatch.setattr(dub.Path, "is_file", lambda self: False)
-        assert dub.burn_capable_ffmpeg() is None
-
-    def test_burning_invokes_the_capable_build(self, monkeypatch, tmp_path) -> None:
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured.setdefault("command", command)
-            return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub, "burn_capable_ffmpeg", lambda: "/keg/bin/ffmpeg")
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        dub._mux(
-            tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "o.mp4",
-            tmp_path / "s.srt", "ml", burn_subtitles=True,
-        )
-        assert captured["command"][0] == "/keg/bin/ffmpeg"
 
 
 class TestChunkOverlap:
@@ -501,64 +378,13 @@ class TestSynthesizeToFit:
         assert len(calls) == 1
 
 
-class TestBackgroundGain:
-    """Levelling the music to the original video's own balance.
-
-    The bug this replaced: a fixed -8 dB duck ignored how loud the music
-    actually was, so on a real Short the music ended up 5.3 dB quieter
-    relative to speech than in the source, and users heard it as suppressed.
-    """
-
-    def test_a_prominent_soundtrack_stays_prominent(self, monkeypatch, tmp_path) -> None:
-        # Music 5dB under speech in the original: it should stay 5dB under.
-        monkeypatch.setattr(
-            "yt_translator.background.measure_balance", lambda bg, speech: -5.0
-        )
-        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -30.0)
-        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
-        # Target = TTS level (-22) + balance (-5) = -27 dBFS, from -30 => +3 dB
-        assert gain == pytest.approx(3.0, abs=0.1)
-
-    def test_a_quiet_soundtrack_stays_quiet(self, monkeypatch, tmp_path) -> None:
-        """Matching the original means not inventing loudness either."""
-        monkeypatch.setattr(
-            "yt_translator.background.measure_balance", lambda bg, speech: -25.0
-        )
-        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -30.0)
-        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
-        assert gain < 0, "a barely-there soundtrack should be pushed down, not up"
-
-    def test_boosting_is_capped(self, monkeypatch, tmp_path) -> None:
-        """A near-silent bed must not be amplified into hiss."""
-        monkeypatch.setattr(
-            "yt_translator.background.measure_balance", lambda bg, speech: 0.0
-        )
-        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -90.0)
-        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
-        assert gain == dub._MAX_BACKGROUND_GAIN_DB
-
-    def test_attenuation_is_floored(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            "yt_translator.background.measure_balance", lambda bg, speech: -60.0
-        )
-        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: -10.0)
-        gain = dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav")
-        assert gain == dub._MIN_BACKGROUND_GAIN_DB
-
-    def test_an_unmeasurable_background_is_left_alone(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            "yt_translator.background.measure_balance", lambda bg, speech: -10.0
-        )
-        monkeypatch.setattr(dub, "_rms_dbfs_or", lambda path, default: None)
-        assert dub._background_gain_db(tmp_path / "bg.wav", tmp_path / "vox.wav") == 0.0
-
     def test_the_gain_reaches_the_mixer(self, result, monkeypatch, tmp_path) -> None:
         seen = {}
         _stub_pipeline(
             monkeypatch, dub,
             _split_background=lambda audio, w, speech: (w / "background.wav", speech),
-            _background_gain_db=lambda bg, speech: 4.5,
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+            background_gain_db=lambda bg, speech: 4.5,
+            build_dubbed_audio=lambda c, cl, d, w, rooms, bg=None, gain=0.0: (
                 seen.setdefault("gain", gain) or (w / "a.wav")
             ),
         )
@@ -573,7 +399,7 @@ class TestKeepBackground:
         seen = {}
         _stub_pipeline(
             monkeypatch, dub,
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+            build_dubbed_audio=lambda c, cl, d, w, rooms, bg=None, gain=0.0: (
                 seen.setdefault("bg", bg) or (w / "a.wav")
             ),
         )
@@ -585,7 +411,7 @@ class TestKeepBackground:
         _stub_pipeline(
             monkeypatch, dub,
             _split_background=lambda audio, w, speech: (w / "background.wav", speech),
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+            build_dubbed_audio=lambda c, cl, d, w, rooms, bg=None, gain=0.0: (
                 seen.setdefault("bg", bg) or (w / "a.wav")
             ),
         )
@@ -606,7 +432,7 @@ class TestKeepBackground:
         seen = {}
         _stub_pipeline(
             monkeypatch, dub,
-            _build_dubbed_audio=lambda c, cl, d, w, bg=None, gain=0.0: (
+            build_dubbed_audio=lambda c, cl, d, w, rooms, bg=None, gain=0.0: (
                 seen.setdefault("bg", bg) or (w / "a.wav")
             ),
         )
@@ -685,7 +511,7 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "_synthesize_chunk", lambda t, v, o, hint=None: None)
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+            dub, "build_dubbed_audio", lambda c, cl, d, w, rooms, bg=None, gain=0.0: w / "a.wav"
         )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
@@ -701,9 +527,10 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "_download_source_audio", lambda v, w: w / "a.mp3")
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 200.0)
+        monkeypatch.setattr(dub, "measure_baseline_energy", lambda p: -20.0)
         monkeypatch.setattr(
             dub, "analyse_segments",
-            lambda audio, chunks, baseline, shift=0, register=None:
+            lambda audio, chunks, baseline, shift=0, register=None, energy_baseline=None:
                 [ProsodyHint(pitch_hz=15, rate_percent=7)] * len(chunks),
         )
         monkeypatch.setattr(
@@ -711,7 +538,7 @@ class TestMatchTone:
             lambda t, v, o, hint=None: seen_hints.append(hint),
         )
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+            dub, "build_dubbed_audio", lambda c, cl, d, w, rooms, bg=None, gain=0.0: w / "a.wav"
         )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
@@ -730,9 +557,10 @@ class TestMatchTone:
         monkeypatch.setattr(dub, "_download_source_audio", lambda v, w: w / "a.mp3")
         monkeypatch.setattr(dub, "_probe_duration", lambda p: 4.0)
         monkeypatch.setattr(dub, "measure_baseline", lambda p: 0.0)
+        monkeypatch.setattr(dub, "measure_baseline_energy", lambda p: None)
         monkeypatch.setattr(
             dub, "analyse_segments",
-            lambda audio, chunks, baseline, shift=0, register=None:
+            lambda audio, chunks, baseline, shift=0, register=None, energy_baseline=None:
                 [ProsodyHint()] * len(chunks),
         )
         monkeypatch.setattr(
@@ -740,7 +568,7 @@ class TestMatchTone:
             lambda text, voice, out, hint, room: seen.append(hint),
         )
         monkeypatch.setattr(
-            dub, "_build_dubbed_audio", lambda c, cl, d, w, bg=None, gain=0.0: w / "a.wav"
+            dub, "build_dubbed_audio", lambda c, cl, d, w, rooms, bg=None, gain=0.0: w / "a.wav"
         )
         monkeypatch.setattr(dub, "_mux", lambda v, a, o, s=None, lang=None, burn=False: None)
 
@@ -791,7 +619,7 @@ class TestSynthesizeChunk:
             "hallo", "de-DE-AmalaNeural", tmp_path / "o.mp3",
             ProsodyHint(pitch_hz=-18, rate_percent=-9),
         )
-        assert seen == {"rate": "-9%", "pitch": "-18Hz"}
+        assert seen == {"rate": "-9%", "pitch": "-18Hz", "volume": "+0%"}
 
     def test_a_neutral_hint_sends_no_overrides(self, monkeypatch, tmp_path) -> None:
         """Neutral must mean 'don't touch it', not '+0Hz' noise on every call."""
@@ -893,124 +721,26 @@ class TestDownloadVideo:
 
 
 class TestProbeDuration:
-    """ffprobe wrapper, via a stubbed subprocess.run."""
+    """The thin DubbingError-wrapping layer over media.probe_duration.
 
-    def test_parses_the_duration(self, monkeypatch, tmp_path) -> None:
-        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="12.345\n", stderr="")
-        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
+    ffprobe parsing itself is media.py's own concern and is fully covered in
+    test_media.py; this only needs to check the error gets rewrapped so
+    callers see the error they asked dubbing for, not a media-layer one.
+    """
+
+    def test_delegates_to_media_probe_duration(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(dub, "probe_duration", lambda path: 12.345)
         assert dub._probe_duration(tmp_path / "x.mp4") == 12.345
 
-    def test_wraps_a_nonzero_exit(self, monkeypatch, tmp_path) -> None:
-        def raise_called_process_error(*a, **k):
-            raise subprocess.CalledProcessError(1, "ffprobe")
+    def test_a_media_error_is_rewrapped_as_a_dubbing_error(self, monkeypatch, tmp_path) -> None:
+        from yt_translator.media import MediaError
 
-        monkeypatch.setattr(dub.subprocess, "run", raise_called_process_error)
-        with pytest.raises(dub.DubbingError, match="duration"):
-            dub._probe_duration(tmp_path / "x.mp4")
+        def boom(path):
+            raise MediaError("could not read the duration")
 
-    def test_wraps_unparseable_output(self, monkeypatch, tmp_path) -> None:
-        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="not a number", stderr="")
-        monkeypatch.setattr(dub.subprocess, "run", lambda *a, **k: fake)
+        monkeypatch.setattr(dub, "probe_duration", boom)
         with pytest.raises(dub.DubbingError, match="duration"):
             dub._probe_duration(tmp_path / "x.mp4")
 
 
-class TestBuildDubbedAudio:
-    """The ffmpeg filter_complex construction, via a stubbed subprocess.run."""
 
-    def test_applies_atempo_only_when_the_clip_overruns_its_window(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        # Chunk 1 fits easily (no atempo needed); chunk 2 overruns (atempo needed).
-        monkeypatch.setattr(
-            dub, "_probe_duration", lambda path: 1.0 if "0000" in path.name else 5.0
-        )
-
-        # Chunk 2 is followed by a third, so it cannot borrow the tail of the
-        # video - it really does have only 2 seconds to speak into.
-        chunks = [Segment(0.0, 5.0, "a"), Segment(5.0, 2.0, "b"), Segment(7.0, 3.0, "c")]
-        clips = [tmp_path / f"chunk_{i:04d}.mp3" for i in range(3)]
-        dub._build_dubbed_audio(chunks, clips, total_duration=10.0, workdir=tmp_path)
-
-        filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
-        first_stage = filter_arg.split(";")[0]
-        assert "atempo" not in first_stage, "the fitting clip must not be sped up"
-        assert "atempo=2.000" in filter_arg, "5s speech in a 2s window should clamp to the 2x cap"
-
-    def test_speech_may_use_the_gap_before_the_next_chunk(self, monkeypatch, tmp_path) -> None:
-        """Translations run long; silence after a chunk is room to speak into.
-
-        Compressing speech while the following seconds sit empty is what made
-        dubs sound rushed - 5 of 6 chunks were being sped up on a real video.
-        """
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        monkeypatch.setattr(dub, "_probe_duration", lambda path: 4.0)
-
-        # The caption spans 2s, but nothing else speaks until t=6: 6s of room.
-        chunks = [Segment(0.0, 2.0, "a"), Segment(6.0, 2.0, "b")]
-        clips = [tmp_path / f"chunk_{i:04d}.mp3" for i in range(2)]
-        dub._build_dubbed_audio(chunks, clips, total_duration=10.0, workdir=tmp_path)
-
-        filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
-        assert "atempo" not in filter_arg.split(";")[0], "4s of speech fits in a 6s gap"
-
-    def test_the_last_chunk_may_run_to_the_end_of_the_video(self, monkeypatch, tmp_path) -> None:
-        captured = {}
-
-        def fake_run(command, **kwargs):
-            captured["command"] = command
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        monkeypatch.setattr(dub.subprocess, "run", fake_run)
-        monkeypatch.setattr(dub, "_probe_duration", lambda path: 5.0)
-
-        chunks = [Segment(2.0, 1.0, "only")]
-        dub._build_dubbed_audio(
-            chunks, [tmp_path / "chunk_0000.mp3"], total_duration=10.0, workdir=tmp_path
-        )
-
-        filter_arg = captured["command"][captured["command"].index("-filter_complex") + 1]
-        assert "atempo" not in filter_arg, "5s of speech fits in the 8s remaining"
-
-    def test_raises_on_ffmpeg_failure(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(dub, "_probe_duration", lambda path: 1.0)
-        monkeypatch.setattr(
-            dub.subprocess, "run",
-            lambda *a, **k: subprocess.CompletedProcess([], 1, stdout="", stderr="boom"),
-        )
-        chunks = [Segment(0.0, 1.0, "a")]
-        clips = [tmp_path / "chunk_0000.mp3"]
-        with pytest.raises(dub.DubbingError, match="boom"):
-            dub._build_dubbed_audio(chunks, clips, total_duration=1.0, workdir=tmp_path)
-
-
-class TestMux:
-    """Final video+audio combination, via a stubbed subprocess.run."""
-
-    def test_raises_on_ffmpeg_failure(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            dub.subprocess, "run",
-            lambda *a, **k: subprocess.CompletedProcess([], 1, stdout="", stderr="codec error"),
-        )
-        with pytest.raises(dub.DubbingError, match="codec error"):
-            dub._mux(tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "out.mp4")
-
-    def test_success_does_not_raise(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            dub.subprocess, "run",
-            lambda *a, **k: subprocess.CompletedProcess([], 0, stdout="", stderr=""),
-        )
-        dub._mux(tmp_path / "v.mp4", tmp_path / "a.wav", tmp_path / "out.mp4")  # Must not raise.

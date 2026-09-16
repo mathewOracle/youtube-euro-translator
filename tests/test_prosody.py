@@ -40,6 +40,12 @@ class TestProsodyHint:
         assert ProsodyHint().is_neutral is True
         assert ProsodyHint(pitch_hz=1).is_neutral is False
         assert ProsodyHint(rate_percent=1).is_neutral is False
+        assert ProsodyHint(volume_percent=1).is_neutral is False
+
+    def test_formats_volume_the_way_edge_tts_expects(self) -> None:
+        assert ProsodyHint(volume_percent=15).volume == "+15%"
+        assert ProsodyHint(volume_percent=-15).volume == "-15%"
+        assert ProsodyHint().volume == "+0%"
 
 
 class TestSemitones:
@@ -131,6 +137,72 @@ class TestMedianF0:
         assert prosody._median_f0(np.array([], dtype="float32")) == 0.0
 
 
+class TestMedianEnergyDb:
+    """Loudness measurement, against synthetic tones."""
+
+    @staticmethod
+    def _tone(seconds: float = 0.5, amplitude: float = 8000.0):
+        import numpy as np
+
+        t = np.arange(int(prosody._SAMPLE_RATE * seconds)) / prosody._SAMPLE_RATE
+        return (amplitude * np.sin(2 * math.pi * 150.0 * t)).astype("float32")
+
+    def test_a_louder_tone_measures_louder(self) -> None:
+        quiet = prosody._median_energy_db(self._tone(amplitude=2000.0))
+        loud = prosody._median_energy_db(self._tone(amplitude=16000.0))
+        assert loud > quiet
+
+    def test_silence_yields_no_estimate(self) -> None:
+        import numpy as np
+
+        assert prosody._median_energy_db(np.zeros(prosody._SAMPLE_RATE, dtype="float32")) is None
+
+    def test_none_is_used_rather_than_a_sentinel_number(self) -> None:
+        """Unlike pitch, 0 dB is a real loudness - it cannot mean 'unmeasured'."""
+        import numpy as np
+
+        assert prosody._median_energy_db(np.array([], dtype="float32")) is None
+
+
+class TestDbToVolumePercent:
+    """Mapping a measured loudness deviation onto an edge-tts volume request."""
+
+    def test_no_deviation_is_neutral(self) -> None:
+        assert prosody._db_to_volume_percent(0.0) == 0
+
+    def test_louder_than_baseline_requests_a_positive_volume(self) -> None:
+        assert prosody._db_to_volume_percent(4.0) > 0
+
+    def test_quieter_than_baseline_requests_a_negative_volume(self) -> None:
+        assert prosody._db_to_volume_percent(-4.0) < 0
+
+    def test_up_and_down_are_not_symmetric(self) -> None:
+        """Measured against the live service: down moves ~0.10 dB/%, up ~0.08
+        dB/% - a steeper response, so reaching the same dB target downward
+        takes FEWER requested percent than reaching it upward."""
+        up = prosody._db_to_volume_percent(4.0)
+        down = prosody._db_to_volume_percent(-4.0)
+        assert abs(down) < abs(up)
+
+    def test_extreme_deviations_are_capped(self) -> None:
+        assert prosody._db_to_volume_percent(100.0) == prosody._MAX_VOLUME_PERCENT
+        assert prosody._db_to_volume_percent(-100.0) == -prosody._MAX_VOLUME_PERCENT
+
+
+class TestMeasureBaselineEnergy:
+    """The public entry point, via a stubbed decode."""
+
+    def test_delegates_to_median_energy_db(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(prosody, "_decode", lambda path: [1])
+        monkeypatch.setattr(prosody, "_median_energy_db", lambda samples: -18.5)
+        assert prosody.measure_baseline_energy(tmp_path / "x.mp3") == -18.5
+
+    def test_silence_yields_none(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(prosody, "_decode", lambda path: [1])
+        monkeypatch.setattr(prosody, "_median_energy_db", lambda samples: None)
+        assert prosody.measure_baseline_energy(tmp_path / "x.mp3") is None
+
+
 class TestAnalyseSegments:
     """Per-chunk analysis and its graceful-degradation paths."""
 
@@ -160,6 +232,22 @@ class TestAnalyseSegments:
         assert hints[0].pitch_hz > 0, "a chunk above baseline should raise pitch"
         assert hints[1].pitch_hz < 0, "a chunk below baseline should lower pitch"
         assert hints[2].is_neutral, "a chunk at baseline should be unchanged"
+
+    def test_energy_baseline_drives_volume(self, monkeypatch, tmp_path) -> None:
+        """Without an energy baseline, volume must stay untouched - a missing
+        reference is not something to guess a comparison against."""
+        monkeypatch.setattr(prosody, "_decode", lambda *a, **k: [1])
+        monkeypatch.setattr(prosody, "_median_f0", lambda samples: 200.0)  # at baseline
+        monkeypatch.setattr(prosody, "_median_energy_db", lambda samples: -10.0)
+
+        chunks = [Segment(0.0, 1.0, "x")]
+        without_energy = prosody.analyse_segments(tmp_path / "x.mp3", chunks, 200.0)
+        assert without_energy[0].volume_percent == 0
+
+        with_energy = prosody.analyse_segments(
+            tmp_path / "x.mp3", chunks, 200.0, energy_baseline_db=-20.0
+        )
+        assert with_energy[0].volume_percent > 0, "louder than the speaker's norm"
 
     def test_no_chunks_means_no_hints(self, tmp_path) -> None:
         assert prosody.analyse_segments(tmp_path / "x.mp3", [], 200.0) == []

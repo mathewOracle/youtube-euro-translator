@@ -32,6 +32,7 @@ __all__ = [
     "analyse_segments",
     "classify_register",
     "measure_baseline",
+    "measure_baseline_energy",
     "register_offset_hz",
 ]
 
@@ -82,6 +83,22 @@ _PITCH_TRACKING = 0.35
 # animated, but tying rate too tightly to pitch makes excited lines gabble.
 _RATE_PERCENT_PER_SEMITONE = 2.0
 
+# How a requested volume percent turns into actual loudness change, measured
+# against the live service (identical for de-DE-Katja and de-DE-Conrad, so
+# unlike pitch this needed no per-register split): asking for -30% moved
+# -3.1dB (0.10 dB/%), +30% moved +2.3dB (0.08 dB/%) - down and up are not
+# symmetric. The response also visibly compresses past +-50% request (+50%
+# and +80% measured the SAME), so requests are capped well short of that.
+_DB_PER_PERCENT_DOWN = 0.10
+_DB_PER_PERCENT_UP = 0.08
+_MAX_VOLUME_PERCENT = 40
+
+# Unlike _PITCH_TRACKING, this has not been tuned by rendering full dubs and
+# listening - said plainly rather than implying a rigour this lacks yet.
+# Kept conservative until it has: reproducing a bit of a speaker's loudness
+# swing is a safe bet, reproducing all of it is not.
+_VOLUME_TRACKING = 0.5
+
 
 @dataclass(frozen=True)
 class ProsodyHint:
@@ -90,10 +107,12 @@ class ProsodyHint:
     Attributes:
         pitch_hz: Pitch offset in Hz, as edge-tts expects it.
         rate_percent: Speaking-rate offset in percent.
+        volume_percent: Volume offset in percent, as edge-tts expects it.
     """
 
     pitch_hz: int = 0
     rate_percent: int = 0
+    volume_percent: int = 0
 
     @property
     def pitch(self) -> str:
@@ -106,9 +125,14 @@ class ProsodyHint:
         return f"{self.rate_percent:+d}%"
 
     @property
+    def volume(self) -> str:
+        """The ``volume`` argument for edge-tts, e.g. ``'-15%'``."""
+        return f"{self.volume_percent:+d}%"
+
+    @property
     def is_neutral(self) -> bool:
         """True if this asks for no change at all."""
-        return self.pitch_hz == 0 and self.rate_percent == 0
+        return self.pitch_hz == 0 and self.rate_percent == 0 and self.volume_percent == 0
 
 
 def measure_baseline(audio_path: Path) -> float:
@@ -123,6 +147,20 @@ def measure_baseline(audio_path: Path) -> float:
         Median F0 in Hz, or ``0.0`` if no voiced speech was found.
     """
     return _median_f0(_decode(audio_path))
+
+
+def measure_baseline_energy(audio_path: Path) -> float | None:
+    """Median loudness across a whole recording, in dBFS.
+
+    The reference each chunk's own loudness is compared against, for the
+    same reason pitch is compared to a baseline rather than judged in
+    isolation: a speaker who is simply loud throughout should not have every
+    line read as emphatic.
+
+    Returns:
+        Median loudness in dBFS, or ``None`` if no voiced speech was found.
+    """
+    return _median_energy_db(_decode(audio_path))
 
 
 #: Rough dividing line between typical adult male and female speaking pitch.
@@ -179,6 +217,7 @@ def analyse_segments(
     baseline_hz: float,
     register_shift_hz: int = 0,
     register: str | None = None,
+    energy_baseline_db: float | None = None,
 ) -> list[ProsodyHint]:
     """Measure each chunk's delivery against the speaker's baseline.
 
@@ -191,6 +230,10 @@ def analyse_segments(
             expressiveness rides on top of this.
         register: ``"male"`` or ``"female"``, selecting the calibrated
             pitch response measured for that voice.
+        energy_baseline_db: This speaker's median loudness, from
+            :func:`measure_baseline_energy`. Optional: without it, chunks
+            get no volume adjustment, rather than one measured against a
+            missing reference.
 
     Returns:
         One :class:`ProsodyHint` per chunk, in the same order. Chunks whose
@@ -204,19 +247,48 @@ def analyse_segments(
     for chunk in chunks:
         samples = _decode(audio_path, start=chunk.start, duration=chunk.duration)
         median = _median_f0(samples)
+
+        energy_delta_db = 0.0
+        if energy_baseline_db is not None:
+            chunk_energy = _median_energy_db(samples)
+            if chunk_energy is not None:
+                energy_delta_db = chunk_energy - energy_baseline_db
+
         if median <= 0:
-            hints.append(ProsodyHint(pitch_hz=register_shift_hz))
+            hints.append(
+                ProsodyHint(
+                    pitch_hz=register_shift_hz,
+                    volume_percent=_db_to_volume_percent(energy_delta_db),
+                )
+            )
             continue
         hints.append(
-            _to_hint(_semitones(median, baseline_hz), register_shift_hz, register)
+            _to_hint(
+                _semitones(median, baseline_hz), register_shift_hz, register, energy_delta_db
+            )
         )
     return hints
 
 
+def _db_to_volume_percent(delta_db: float) -> int:
+    """Turn a loudness deviation in dB into an edge-tts volume request.
+
+    Down and up are not symmetric in the service's actual response (see the
+    ``_DB_PER_PERCENT_*`` constants), so the conversion picks the rate for
+    the direction being requested before scaling and capping.
+    """
+    tracked = delta_db * _VOLUME_TRACKING
+    per_percent = _DB_PER_PERCENT_DOWN if tracked < 0 else _DB_PER_PERCENT_UP
+    return _clamp(round(tracked / per_percent), _MAX_VOLUME_PERCENT)
+
+
 def _to_hint(
-    semitones: float, register_shift_hz: int = 0, register: str | None = None
+    semitones: float,
+    register_shift_hz: int = 0,
+    register: str | None = None,
+    energy_delta_db: float = 0.0,
 ) -> ProsodyHint:
-    """Turn a pitch deviation in semitones into synthesis parameters.
+    """Turn a pitch and loudness deviation into synthesis parameters.
 
     Args:
         semitones: How far this line sat above or below the speaker's norm.
@@ -227,6 +299,8 @@ def _to_hint(
         register: ``"male"`` or ``"female"``, selecting the calibrated
             Hz-per-semitone for that voice. Falls back to a middling value
             when unknown, which is wrong by a little rather than a lot.
+        energy_delta_db: How far this line's loudness sat from the
+            speaker's norm, in dB.
     """
     hz_per_semitone = _HZ_PER_SEMITONE_BY_REGISTER.get(
         register or "", _DEFAULT_HZ_PER_SEMITONE
@@ -235,7 +309,10 @@ def _to_hint(
         round(semitones * _PITCH_TRACKING * hz_per_semitone), _MAX_PITCH_HZ
     )
     rate = _clamp(round(semitones * _RATE_PERCENT_PER_SEMITONE), _MAX_RATE_PERCENT)
-    return ProsodyHint(pitch_hz=expressive + register_shift_hz, rate_percent=rate)
+    volume = _db_to_volume_percent(energy_delta_db)
+    return ProsodyHint(
+        pitch_hz=expressive + register_shift_hz, rate_percent=rate, volume_percent=volume
+    )
 
 
 def _clamp(value: float, limit: int) -> int:
@@ -291,19 +368,11 @@ def _median_f0(samples: object) -> float:
     if len(samples) < _FRAME:
         return 0.0
 
-    overall_rms = float(np.sqrt((samples**2).mean()))
-    if overall_rms <= 0:
-        return 0.0
-    threshold = max(_MIN_RMS, overall_rms * _VOICED_FRACTION)
-
     min_lag = int(_SAMPLE_RATE / _MAX_F0)
     max_lag = int(_SAMPLE_RATE / _MIN_F0)
 
     estimates = []
-    for start in range(0, len(samples) - _FRAME, _HOP):
-        frame = samples[start : start + _FRAME]
-        if np.sqrt((frame**2).mean()) < threshold:
-            continue  # Silence or room tone, not speech.
+    for frame in _voiced_frames(samples):
         frame = frame - frame.mean()
         correlation = np.correlate(frame, frame, "full")[_FRAME - 1 :]
         if max_lag >= len(correlation):
@@ -313,3 +382,46 @@ def _median_f0(samples: object) -> float:
             estimates.append(_SAMPLE_RATE / lag)
 
     return float(np.median(estimates)) if estimates else 0.0
+
+
+def _voiced_frames(samples: object) -> list:
+    """Frames of ``samples`` that clear the voiced-vs-silence gate.
+
+    Shared by every per-chunk measurement - pitch and loudness alike - since
+    a quiet frame is silence or room tone, not something to measure a
+    speaker's delivery from.
+    """
+    import numpy as np
+
+    if len(samples) < _FRAME:
+        return []
+    overall_rms = float(np.sqrt((samples**2).mean()))
+    if overall_rms <= 0:
+        return []
+    threshold = max(_MIN_RMS, overall_rms * _VOICED_FRACTION)
+
+    frames = []
+    for start in range(0, len(samples) - _FRAME, _HOP):
+        frame = samples[start : start + _FRAME]
+        if np.sqrt((frame**2).mean()) >= threshold:
+            frames.append(frame)
+    return frames
+
+
+def _median_energy_db(samples: object) -> float | None:
+    """Median loudness across voiced frames, in dBFS.
+
+    ``None`` rather than a sentinel number: unlike pitch, ``0`` dB is a real
+    (if unlikely) loudness, so it cannot double as "nothing measured" the
+    way ``0.0`` Hz does for :func:`_median_f0`.
+    """
+    import numpy as np
+
+    frames = _voiced_frames(samples)
+    if not frames:
+        return None
+    levels = [
+        20.0 * float(np.log10(max(float(np.sqrt((frame**2).mean())), 1.0) / 32768.0))
+        for frame in frames
+    ]
+    return float(np.median(levels))

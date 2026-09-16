@@ -23,18 +23,22 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
 from .media import MediaError, download_audio, download_video, probe_duration
+from .mixer import FIT_SAFETY as _FIT_SAFETY
+from .mixer import MixError, background_gain_db, build_dubbed_audio
 from .models import Segment, Transcript, TranslationResult
+from .muxing import MuxError, supports_burned_subtitles
+from .muxing import mux as _mux
 from .prosody import (
     ProsodyHint,
     analyse_segments,
     classify_register,
     measure_baseline,
+    measure_baseline_energy,
     register_offset_hz,
 )
 from .renderers import to_srt as _render_srt
@@ -98,13 +102,6 @@ VOICE_MAP: dict[str, str] = {code: pair["female"] for code, pair in VOICES.items
 #: Accepted values for the ``voice_gender`` argument.
 GENDERS = ("female", "male")
 
-# ffmpeg's atempo filter only accepts a single instance in [0.5, 2.0]. We
-# never slow speech down (that sounds worse than finishing early), and cap
-# the speed-up rather than chaining atempo filters for a niche extra case.
-# Ceiling on how far a chunk may be compressed to fit its slot. Beyond
-# this, speech stops being followable regardless of how it is compressed.
-_MAX_TEMPO = 2.0
-
 # Compression up to this much is done by re-synthesizing the line at a
 # faster speaking rate, which is real speech and sounds natural. Past it,
 # ffmpeg's atempo takes over the remainder: re-synthesis alone at extreme
@@ -113,10 +110,6 @@ _MAX_TEMPO = 2.0
 # (+50% asked, 1.50x delivered), so this is a reliable budget.
 _MAX_NATIVE_RATE = 1.35
 
-# Leave a sliver of headroom when fitting speech to its slot, so rounding
-# and codec padding cannot make a clip overrun the next one.
-_FIT_SAFETY = 0.98
-
 
 #: Natural speaking pitch of the neural voices, by register, measured from
 #: real synthesis of a full sentence (de-DE-Katja 190 Hz, de-DE-Conrad
@@ -124,20 +117,6 @@ _FIT_SAFETY = 0.98
 #: enough that per-voice measurement would cost a synthesis round-trip for a
 #: few Hz, and the shift this feeds is capped anyway.
 VOICE_PITCH_HZ: dict[str, float] = {"female": 190.0, "male": 114.0}
-
-# Measured loudness of edge-tts speech, in dBFS. The synthesized voice is
-# consistent enough across voices and languages to treat as a constant, and
-# it is what the background gets balanced against.
-_TTS_SPEECH_DBFS = -22.0
-
-# Floor on how far the music may be pushed down relative to the dub. Only
-# reached when the original itself buried its music; normally the measured
-# balance is used as-is, so the dub keeps the intensity the source had.
-_MIN_BACKGROUND_GAIN_DB = -20.0
-
-# Ceiling on boosting a quiet bed. Keeps a near-silent or badly separated
-# background from being amplified into hiss.
-_MAX_BACKGROUND_GAIN_DB = 12.0
 
 
 class DubbingError(RuntimeError):
@@ -297,34 +276,42 @@ def dub_video(
             speaking_register = register or voice_gender
 
             if match_tone:
+                energy_baseline = measure_baseline_energy(speech_reference)
                 hints = list(
                     analyse_segments(
-                        speech_reference, chunks, baseline, register_shift, speaking_register
+                        speech_reference, chunks, baseline, register_shift, speaking_register,
+                        energy_baseline,
                     )
                 )
             elif register_shift:
                 hints = [ProsodyHint(pitch_hz=register_shift)] * len(chunks)
 
+        # How long each chunk may speak for. Computed once: synthesis uses
+        # it to pick a speaking rate, and the mixer uses the same budget to
+        # decide what atempo still has to absorb.
+        rooms = [_speaking_room(chunks, i, total_duration) for i in range(len(chunks))]
+
         clip_paths = []
         for i, chunk in enumerate(chunks):
             clip_path = workdir / f"chunk_{i:04d}.mp3"
-            _synthesize_to_fit(
-                chunk.text, voice, clip_path, hints[i],
-                room=_speaking_room(chunks, i, total_duration),
-            )
+            _synthesize_to_fit(chunk.text, voice, clip_path, hints[i], room=rooms[i])
             clip_paths.append(clip_path)
             if on_progress:
                 on_progress(i + 1, len(chunks))
 
         # Reproduce the original's music-to-speech balance, rather than
         # applying a fixed duck that ignores how loud the music really was.
-        background_gain_db = 0.0
+        gain_db = 0.0
         if background_path is not None and speech_reference is not None:
-            background_gain_db = _background_gain_db(background_path, speech_reference)
+            gain_db = background_gain_db(background_path, speech_reference)
 
-        audio_path = _build_dubbed_audio(
-            chunks, clip_paths, total_duration, workdir, background_path, background_gain_db
-        )
+        try:
+            audio_path = build_dubbed_audio(
+                chunks, clip_paths, total_duration, workdir, rooms,
+                background_path, gain_db,
+            )
+        except MixError as exc:
+            raise DubbingError(str(exc)) from exc
 
         subtitle_path = None
         if subtitles is not None:
@@ -335,9 +322,12 @@ def dub_video(
             )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        _mux(
-            video_path, audio_path, out_path, subtitle_path, subtitle_language, burn_subtitles
-        )
+        try:
+            _mux(
+                video_path, audio_path, out_path, subtitle_path, subtitle_language, burn_subtitles
+            )
+        except MuxError as exc:
+            raise DubbingError(str(exc)) from exc
 
     return out_path
 
@@ -419,37 +409,6 @@ def _without_overlap(chunks: list[Segment]) -> list[Segment]:
 _MIN_CHUNK_SECONDS = 1.0
 
 
-def _background_gain_db(background_path: Path, speech_path: Path) -> float:
-    """Gain that reproduces the original video's music-to-speech balance.
-
-    The original mix is the only sensible reference for how loud its music
-    should be. Measure how far the music sat under the original speech, then
-    place it the same distance under the synthesized speech - so a video
-    with a driving soundtrack keeps one, and a quiet one stays quiet.
-
-    Returns:
-        A gain in dB to apply to the separated background.
-    """
-    from .background import measure_balance
-
-    balance_db = measure_balance(background_path, speech_path)
-    background_dbfs = _rms_dbfs_or(background_path, default=None)
-    if background_dbfs is None:
-        return 0.0
-
-    target_dbfs = _TTS_SPEECH_DBFS + balance_db
-    gain = target_dbfs - background_dbfs
-    return max(_MIN_BACKGROUND_GAIN_DB, min(_MAX_BACKGROUND_GAIN_DB, gain))
-
-
-def _rms_dbfs_or(path: Path, default: float | None) -> float | None:
-    """Loudness of ``path`` in dBFS, or ``default`` if it cannot be measured."""
-    from .background import _rms_dbfs
-
-    measured = _rms_dbfs(path)
-    return default if measured is None else measured
-
-
 def _split_background(
     source_audio: Path, workdir: Path, fallback_speech: Path | None
 ) -> tuple[Path | None, Path | None]:
@@ -510,6 +469,7 @@ def _synthesize_to_fit(
     faster = ProsodyHint(
         pitch_hz=hint.pitch_hz if hint else 0,
         rate_percent=(hint.rate_percent if hint else 0) + round((rate - 1.0) * 100),
+        volume_percent=hint.volume_percent if hint else 0,
     )
     _synthesize_chunk(text, voice, out_path, faster)
 
@@ -535,7 +495,7 @@ def _synthesize_chunk(
 
     options = {}
     if hint is not None and not hint.is_neutral:
-        options = {"rate": hint.rate, "pitch": hint.pitch}
+        options = {"rate": hint.rate, "pitch": hint.pitch, "volume": hint.volume}
 
     async def _run() -> None:
         await edge_tts.Communicate(text, voice, **options).save(str(out_path))
@@ -585,208 +545,6 @@ def _probe_duration(path: Path) -> float:
         raise DubbingError(str(exc)) from exc
 
 
-def _build_dubbed_audio(
-    chunks: list[Segment],
-    clip_paths: list[Path],
-    total_duration: float,
-    workdir: Path,
-    background_path: Path | None = None,
-    background_gain_db: float = 0.0,
-) -> Path:
-    """Mix synthesized clips into one audio track matching the video's timeline.
-
-    Each clip is delayed to its chunk's start time and, if it ran longer
-    than the time available before the next chunk, sped up (capped) to fit.
-    A silent base track the length of the video guarantees the mix comes out
-    exactly ``total_duration`` long, so muxing against the video is trivial.
-
-    If ``background_path`` is given, the original music and ambience is laid
-    underneath at a reduced level, so the dub plays over the real soundtrack
-    rather than over silence.
-
-    Raises:
-        DubbingError: If ffmpeg fails to build the mix.
-    """
-    inputs: list[str] = ["-f", "lavfi", "-i", f"anullsrc=r=24000:cl=mono:d={total_duration:.3f}"]
-    filters: list[str] = []
-    labels: list[str] = ["0:a"]
-    next_input = 1
-
-    if background_path is not None:
-        inputs += ["-i", str(background_path)]
-        # Level the bed to match the original video's balance, and force it
-        # to mono so it mixes cleanly with the mono speech and silence base.
-        filters.append(
-            f"[{next_input}:a]volume={background_gain_db:.2f}dB,"
-            f"aformat=channel_layouts=mono[bg]"
-        )
-        labels.append("bg")
-        next_input += 1
-
-    for index, (chunk, clip_path) in enumerate(zip(chunks, clip_paths, strict=True)):
-        inputs += ["-i", str(clip_path)]
-        clip_duration = _probe_duration(clip_path)
-        delay_ms = max(0, round(chunk.start * 1000))
-
-        # Speak into the gap before the next chunk, not just the caption's
-        # own span - otherwise speech is compressed while silence follows it.
-        # Most of the fitting already happened at synthesis time; atempo only
-        # covers whatever a natural speaking rate could not absorb.
-        room = _speaking_room(chunks, index, total_duration) * _FIT_SAFETY
-        tempo = clip_duration / room if room > 0 else 1.0
-        tempo = min(max(tempo, 1.0), _MAX_TEMPO)
-
-        stage = f"[{next_input}:a]"
-        if tempo > 1.0:
-            stage += f"atempo={tempo:.3f},"
-        stage += f"adelay={delay_ms}:all=1[a{next_input}]"
-        filters.append(stage)
-        labels.append(f"a{next_input}")
-        next_input += 1
-
-    mix_inputs = "".join(f"[{label}]" for label in labels)
-    filters.append(f"{mix_inputs}amix=inputs={len(labels)}:duration=first:normalize=0[aout]")
-
-    out_path = workdir / "dubbed_audio.wav"
-    command = [
-        "ffmpeg", "-y", *inputs,
-        "-filter_complex", ";".join(filters),
-        "-map", "[aout]", str(out_path),
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise DubbingError(f"Failed to mix dubbed audio: {completed.stderr[-500:]}")
-    return out_path
-
-
-#: ffmpeg builds to try for subtitle burn-in, in preference order.
-#:
-#: Homebrew ships a slim default ``ffmpeg`` without libass and a separate
-#: ``ffmpeg-full`` that has it. ffmpeg-full is *keg-only*: it is not linked
-#: into the PATH and its binary is still called ``ffmpeg``, so it can only
-#: be reached by its full keg path. Checking these means a user who has
-#: installed it need not reorder their PATH or pass anything extra.
-_FFMPEG_CANDIDATES = (
-    "ffmpeg",
-    "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",  # Homebrew, Apple silicon
-    "/usr/local/opt/ffmpeg-full/bin/ffmpeg",  # Homebrew, Intel
-)
-
-
-def burn_capable_ffmpeg() -> str | None:
-    """Path to an installed ffmpeg that can burn subtitles, if any.
-
-    Burning needs the ``subtitles`` filter, which requires ffmpeg to have
-    been built with libass. Plenty of builds - including Homebrew's default
-    - are not, so this is checked rather than assumed: the alternative is a
-    render that fails minutes in, after the download and synthesis are done.
-
-    Returns:
-        An executable to invoke, or ``None`` if none can burn.
-    """
-    for candidate in _FFMPEG_CANDIDATES:
-        resolved = shutil.which(candidate) or (
-            candidate if Path(candidate).is_file() else None
-        )
-        if resolved and _has_subtitles_filter(resolved):
-            return resolved
-    return None
-
-
-def supports_burned_subtitles() -> bool:
-    """True if any installed ffmpeg can burn subtitles into the picture."""
-    return burn_capable_ffmpeg() is not None
-
-
-def _has_subtitles_filter(executable: str) -> bool:
-    """True if ``executable`` exposes the libass-backed ``subtitles`` filter."""
-    try:
-        completed = subprocess.run(
-            [executable, "-hide_banner", "-filters"], capture_output=True, text=True
-        )
-    except OSError:
-        return False
-    return completed.returncode == 0 and " subtitles " in completed.stdout
-
-
-def _mux(
-    video_path: Path,
-    audio_path: Path,
-    out_path: Path,
-    subtitle_path: Path | None = None,
-    subtitle_language: str | None = None,
-    burn_subtitles: bool = False,
-) -> None:
-    """Combine the video stream, the dubbed audio, and optional subtitles.
-
-    Subtitles are embedded as a *selectable* mov_text track by default: the
-    viewer can toggle them, and the original script (Malayalam included)
-    round-trips as UTF-8 text rather than being rasterised into pixels at a
-    fixed size. The track is marked default and given a readable title, since
-    a track no player surfaces is indistinguishable from no track at all.
-
-    With ``burn_subtitles`` the text is drawn permanently into the picture
-    instead, for players and sites that ignore soft tracks entirely. That
-    requires re-encoding the video, so it is slower and lossier.
-
-    Raises:
-        DubbingError: If ffmpeg fails to combine them.
-    """
-    executable = "ffmpeg"
-    if subtitle_path is not None and burn_subtitles:
-        # Burning needs a libass-enabled build, which may not be the ffmpeg
-        # first on PATH.
-        executable = burn_capable_ffmpeg() or "ffmpeg"
-
-    command = [executable, "-y", "-i", str(video_path), "-i", str(audio_path)]
-
-    if subtitle_path is not None and burn_subtitles:
-        # Burned-in: the subtitle is a filter input, not a muxed stream.
-        command += [
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-vf", f"subtitles={_escape_filter_path(subtitle_path)}",
-            "-c:a", "aac",
-        ]
-    elif subtitle_path is not None:
-        command += [
-            "-i", str(subtitle_path),
-            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
-            "-c:v", "copy", "-c:a", "aac", "-c:s", "mov_text",
-            # Mark it default and name it, so players offer it up front
-            # rather than hiding it in a submenu as "Track 1".
-            "-disposition:s:0", "default",
-        ]
-        if subtitle_language:
-            # ISO 639-2/B is what the mp4 container expects for track labels.
-            # No title is set: MP4's tx3g subtitle tracks have nowhere to
-            # store one (verified - ffmpeg accepts -metadata title on them
-            # and silently drops it), so players label the track from its
-            # language code alone.
-            command += [
-                "-metadata:s:s:0", f"language={_iso639_2(subtitle_language)}",
-            ]
-    else:
-        command += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac"]
-
-    command += ["-shortest", str(out_path)]
-
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise DubbingError(f"Failed to combine video and dubbed audio: {completed.stderr[-500:]}")
-
-
-def _escape_filter_path(path: Path) -> str:
-    """Escape a path for use inside an ffmpeg filter argument.
-
-    ffmpeg's filter syntax treats ``:``, ``'`` and ``\\`` specially, so a
-    path containing them silently breaks the filter graph.
-    """
-    text = str(path)
-    for char in ("\\", "'", ":"):
-        text = text.replace(char, f"\\{char}")
-    return f"'{text}'"
-
-
 def _language_title(code: str) -> str:
     """A human-readable language name, e.g. ``'Malayalam'``.
 
@@ -813,21 +571,3 @@ _NON_EUROPEAN_NAMES = {
 }
 
 
-#: The handful of 2-letter -> 3-letter language codes we actually emit.
-#: mp4 subtitle tracks are labelled with ISO 639-2; anything unmapped is
-#: passed through, which players treat as "undetermined" rather than failing.
-_ISO_639_2 = {
-    "ml": "mal", "en": "eng", "de": "deu", "fr": "fra", "es": "spa", "it": "ita",
-    "pt": "por", "nl": "nld", "pl": "pol", "ru": "rus", "uk": "ukr", "ro": "ron",
-    "el": "ell", "hu": "hun", "cs": "ces", "sv": "swe", "bg": "bul", "da": "dan",
-    "fi": "fin", "sk": "slk", "no": "nor", "hr": "hrv", "sr": "srp", "lt": "lit",
-    "sl": "slv", "lv": "lav", "et": "est", "mk": "mkd", "sq": "sqi", "bs": "bos",
-    "ca": "cat", "ga": "gle", "cy": "cym", "mt": "mlt", "is": "isl", "eu": "eus",
-    "gl": "glg", "lb": "ltz", "be": "bel", "hi": "hin", "ta": "tam", "te": "tel",
-    "kn": "kan", "ar": "ara", "ja": "jpn", "zh": "zho", "ko": "kor",
-}
-
-
-def _iso639_2(code: str) -> str:
-    """Best-effort 2-letter -> 3-letter language code for mp4 track metadata."""
-    return _ISO_639_2.get(code.split("-")[0].lower(), code)
