@@ -106,6 +106,20 @@ class TestResilience:
         result = translate_transcript(transcript, "de", provider=stubborn)
         assert len(result.segments) == len(transcript.segments)
 
+    def test_the_silent_fallback_still_warns(self, transcript) -> None:
+        """A segment kept in the source language must not vanish silently.
+
+        Downstream, a source-language chunk handed to a target-language
+        voice fails at synthesis with a much more confusing error (edge-tts
+        reports no audio, with no hint that translation is where it went
+        wrong) - so the fallback has to at least warn.
+        """
+        stubborn = FakeTranslator(max_retries=1)
+        stubborn.fail_on = {" ".join(s.text for s in transcript.segments)}
+
+        with pytest.warns(RuntimeWarning, match="could not translate"):
+            translate_transcript(transcript, "de", provider=stubborn)
+
     def test_chain_uses_the_second_backend_when_the_first_fails(self) -> None:
         working = FakeTranslator()
         chain = ChainTranslator([AlwaysFailsTranslator(), working])

@@ -8,6 +8,7 @@ require touching the CLI, the web app, or the SRT renderer.
 from __future__ import annotations
 
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -101,13 +102,27 @@ class Translator(ABC):
         return results
 
     def _translate_with_retry(self, text: str, target: str, source: str) -> str:
-        """Translate with exponential backoff, degrading to the original text."""
+        """Translate with exponential backoff, degrading to the original text.
+
+        The fallback keeps a bad segment from sinking an entire video, but it
+        is silent to the caller by design - so it warns instead, since a
+        downstream synthesizer speaking the *source* language in the
+        *target* voice fails in a much more confusing way (edge-tts simply
+        returns no audio at all) than a translation gap would.
+        """
         delay = 1.0
         for attempt in range(1, self.max_retries + 1):
             try:
                 return self.translate(text, target, source)
-            except TranslationError:
+            except TranslationError as exc:
                 if attempt == self.max_retries:
+                    warnings.warn(
+                        f"{self.name} could not translate a segment after "
+                        f"{self.max_retries} attempt(s) ({exc}); keeping the "
+                        f"original-language text: {text[:60]!r}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                     return text  # Never lose a segment; keep the source words.
                 time.sleep(delay)
                 delay *= 2

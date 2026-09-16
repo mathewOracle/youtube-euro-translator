@@ -477,6 +477,52 @@ class TestDubCommand:
         assert "boom" in result.output
         assert "Traceback" not in result.output
 
+    def test_a_translation_gap_is_surfaced_after_the_progress_bar(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A silently source-language segment must reach the user, not just logs.
+
+        This is exactly the failure mode that otherwise resurfaces many
+        seconds later as an inexplicable "no audio" error from edge-tts.
+        """
+        import warnings
+
+        from yt_translator import cli as cli_module
+
+        def flaky_translate_transcript(transcript, target, provider=None, on_progress=None):
+            warnings.warn(
+                "fake could not translate a segment after 2 attempt(s); "
+                "keeping the original-language text: 'hello'",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if on_progress:
+                on_progress(1, 1)
+            return TranslationResult(
+                video_id=transcript.video_id,
+                source_language=transcript.language,
+                target_language=target,
+                segments=(Segment(0.0, 2.0, "hello"),),
+                provider="fake",
+            )
+
+        def fake_dub_video(result, *, out_path, max_chunk_seconds, voice_gender="female",
+                            match_tone=False, match_voice=False, keep_background=False,
+                            burn_subtitles=False, subtitles=None, subtitle_language=None,
+                            on_progress=None):
+            return out_path
+
+        monkeypatch.setattr(cli_module, "translate_transcript", flaky_translate_transcript)
+        monkeypatch.setattr(cli_module.dub_engine, "dub_video", fake_dub_video)
+
+        result = runner.invoke(
+            cli.app, ["dub", "dQw4w9WgXcQ", "--to", "de", "-o", str(tmp_path / "out.mp4")]
+        )
+        assert result.exit_code == 0, result.output
+        assert "could not be translated" in result.output
+        assert "hello" in result.output
+        assert "OK" in result.output, "one bad segment must not fail the whole dub"
+
 
 class TestCostSafety:
     """The billable backend must never engage by accident."""

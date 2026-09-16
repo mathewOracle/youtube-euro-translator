@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import typer
@@ -227,48 +228,76 @@ def dub_command(
         )
 
     try:
-        with Progress(
-            TextColumn("[cyan]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            console=err,
-        ) as progress:
-            task = progress.add_task(f"Translating to {language.name}", total=None)
+        # Recorded rather than left to print immediately: Rich's live-updating
+        # progress bar below owns the terminal, and a warning printed through
+        # it mid-render gets overwritten by the next redraw and never seen.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            with Progress(
+                TextColumn("[cyan]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                console=err,
+            ) as progress:
+                task = progress.add_task(f"Translating to {language.name}", total=None)
 
-            def advance_translation(done: int, total: int, _t: int = task) -> None:
-                progress.update(_t, completed=done, total=total)
+                def advance_translation(done: int, total: int, _t: int = task) -> None:
+                    progress.update(_t, completed=done, total=total)
 
-            # Fetch once, use twice: the translation needs the transcript, and
-            # --subtitles may need the *original* text from that same fetch.
-            transcript = obtain_transcript(
-                video, source=source, transcribe=transcribe, whisper_model=whisper_model
-            )
-            result = translate_transcript(
-                transcript, language.code, provider=engine, on_progress=advance_translation
-            )
+                # Fetch once, use twice: the translation needs the transcript, and
+                # --subtitles may need the *original* text from that same fetch.
+                transcript = obtain_transcript(
+                    video, source=source, transcribe=transcribe, whisper_model=whisper_model
+                )
+                result = translate_transcript(
+                    transcript, language.code, provider=engine, on_progress=advance_translation
+                )
 
-            subtitle_track = None
-            if subtitles:
-                subtitle_track = transcript if subtitle_language == "source" else result
+                subtitle_track = None
+                if subtitles:
+                    subtitle_track = transcript if subtitle_language == "source" else result
 
-            dub_task = progress.add_task("Downloading video and synthesizing speech", total=None)
+                dub_task = progress.add_task(
+                    "Downloading video and synthesizing speech", total=None
+                )
 
-            def advance_dub(done: int, total: int, _t: int = dub_task) -> None:
-                progress.update(_t, completed=done, total=total)
+                def advance_dub(done: int, total: int, _t: int = dub_task) -> None:
+                    progress.update(_t, completed=done, total=total)
 
-            dub_engine.dub_video(
-                result, out_path=output, max_chunk_seconds=max_chunk_seconds,
-                voice_gender=voice, match_tone=match_tone, match_voice=match_voice,
-                keep_background=keep_background, burn_subtitles=burn_subtitles,
-                subtitles=subtitle_track, on_progress=advance_dub,
-            )
+                dub_engine.dub_video(
+                    result, out_path=output, max_chunk_seconds=max_chunk_seconds,
+                    voice_gender=voice, match_tone=match_tone, match_voice=match_voice,
+                    keep_background=keep_background, burn_subtitles=burn_subtitles,
+                    subtitles=subtitle_track, on_progress=advance_dub,
+                )
+        if caught:
+            _report_translation_gaps(caught, language.name)
     except (TranscriptError, TranslationError, dub_engine.DubbingError) as exc:
         _die(str(exc))
 
     err.print(f"[green]OK[/] Saved dubbed video ({language.name}) -> {output}")
     if subtitles and subtitle_track is not None:
         _report_subtitles(subtitle_track, burn_subtitles)
+
+
+def _report_translation_gaps(caught: list, target_name: str) -> None:
+    """Tell the user which lines stayed in the source language.
+
+    Translation degrades to the original text rather than failing the whole
+    video (see Translator._translate_with_retry) - which is the right call,
+    but silent about it otherwise. Left silent, the first anyone would learn
+    of it is edge-tts inexplicably returning no audio for a chunk it was
+    asked to speak in a language the text was never actually translated
+    into. Surfacing it here turns a confusing TTS failure into an obvious,
+    actionable one.
+    """
+    err.print(
+        f"[yellow]Warning:[/] {len(caught)} line(s) could not be translated to "
+        f"{target_name} and were kept in the original language:"
+    )
+    for warning in caught:
+        err.print(f"     {escape(str(warning.message))}")
 
 
 def _report_subtitles(subtitle_track, burned: bool) -> None:

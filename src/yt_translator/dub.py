@@ -111,6 +111,15 @@ GENDERS = ("female", "male")
 _MAX_NATIVE_RATE = 1.35
 
 
+#: The free edge-tts endpoint occasionally accepts a request and then closes
+#: the stream having sent no audio at all (edge_tts.exceptions.NoAudioReceived)
+#: - a known flakiness of the service, not a sign the request was malformed.
+#: A short retry clears it far more often than it recurs, and is far cheaper
+#: than failing an entire dub over one bad chunk.
+_SYNTHESIS_ATTEMPTS = 3
+_SYNTHESIS_RETRY_DELAY_SECONDS = 1.5
+
+
 #: Natural speaking pitch of the neural voices, by register, measured from
 #: real synthesis of a full sentence (de-DE-Katja 190 Hz, de-DE-Conrad
 #: 114 Hz). Applied to every voice of that register: they cluster tightly
@@ -497,8 +506,21 @@ def _synthesize_chunk(
     if hint is not None and not hint.is_neutral:
         options = {"rate": hint.rate, "pitch": hint.pitch, "volume": hint.volume}
 
+    # Resolved defensively: if a future edge-tts release moves or renames
+    # this exception, retrying should just silently stop happening rather
+    # than crash synthesis outright over an AttributeError in a fallback.
+    retryable = getattr(getattr(edge_tts, "exceptions", None), "NoAudioReceived", None)
+    retryable = (retryable,) if retryable is not None else ()
+
     async def _run() -> None:
-        await edge_tts.Communicate(text, voice, **options).save(str(out_path))
+        for attempt in range(1, _SYNTHESIS_ATTEMPTS + 1):
+            try:
+                await edge_tts.Communicate(text, voice, **options).save(str(out_path))
+                return
+            except retryable:
+                if attempt == _SYNTHESIS_ATTEMPTS:
+                    raise
+                await asyncio.sleep(_SYNTHESIS_RETRY_DELAY_SECONDS * attempt)
 
     try:
         asyncio.run(_run())

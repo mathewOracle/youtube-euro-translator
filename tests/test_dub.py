@@ -10,12 +10,28 @@ mocking the heavy/networked/subprocess seams, so they run fast and offline.
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from yt_translator import dub
 from yt_translator.models import Segment, TranslationResult
+
+
+async def _instant_sleep(*_args, **_kwargs) -> None:
+    """Stand-in for asyncio.sleep so retry tests don't actually wait."""
+
+
+def _fake_exceptions_module() -> tuple[types.ModuleType, type[Exception]]:
+    """A minimal edge_tts.exceptions stand-in, exposing just NoAudioReceived."""
+    module = types.ModuleType("edge_tts.exceptions")
+
+    class NoAudioReceived(Exception):
+        pass
+
+    module.NoAudioReceived = NoAudioReceived
+    return module, NoAudioReceived
 
 
 @pytest.fixture
@@ -670,6 +686,76 @@ class TestSynthesizeChunk:
 
         with pytest.raises(dub.DubbingError, match="no audio"):
             dub._synthesize_chunk("hi", "de-DE-AmalaNeural", tmp_path / "out.mp3")
+
+    def test_no_audio_received_is_retried_and_can_recover(self, monkeypatch, tmp_path) -> None:
+        """The free endpoint's best-known flakiness: empty stream, then fine."""
+        exceptions_module, NoAudioReceived = _fake_exceptions_module()
+        attempts = []
+
+        class FlakyThenFineCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                pass
+
+            async def save(self, path):
+                attempts.append(1)
+                if len(attempts) < 2:
+                    raise NoAudioReceived("No audio was received.")
+                Path(path).write_bytes(b"audio")
+
+        fake_module = type(sys)("edge_tts")
+        fake_module.Communicate = FlakyThenFineCommunicate
+        fake_module.exceptions = exceptions_module
+        monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+        monkeypatch.setattr(dub.asyncio, "sleep", _instant_sleep)
+
+        out_path = tmp_path / "out.mp3"
+        dub._synthesize_chunk("hi", "de-DE-AmalaNeural", out_path)
+        assert len(attempts) == 2
+        assert out_path.read_bytes() == b"audio"
+
+    def test_no_audio_received_eventually_gives_up(self, monkeypatch, tmp_path) -> None:
+        exceptions_module, NoAudioReceived = _fake_exceptions_module()
+        attempts = []
+
+        class AlwaysFlakyCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                pass
+
+            async def save(self, path):
+                attempts.append(1)
+                raise NoAudioReceived("No audio was received.")
+
+        fake_module = type(sys)("edge_tts")
+        fake_module.Communicate = AlwaysFlakyCommunicate
+        fake_module.exceptions = exceptions_module
+        monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+        monkeypatch.setattr(dub.asyncio, "sleep", _instant_sleep)
+
+        with pytest.raises(dub.DubbingError, match="No audio was received"):
+            dub._synthesize_chunk("hi", "de-DE-AmalaNeural", tmp_path / "out.mp3")
+        assert len(attempts) == dub._SYNTHESIS_ATTEMPTS
+
+    def test_a_module_without_the_exceptions_submodule_just_does_not_retry(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A bare-bones or future edge_tts build must degrade, not crash."""
+        attempts = []
+
+        class ExplodingCommunicate:
+            def __init__(self, text, voice, **kwargs):
+                pass
+
+            async def save(self, path):
+                attempts.append(1)
+                raise RuntimeError("boom")
+
+        fake_module = type(sys)("edge_tts")
+        fake_module.Communicate = ExplodingCommunicate
+        monkeypatch.setitem(sys.modules, "edge_tts", fake_module)
+
+        with pytest.raises(dub.DubbingError, match="boom"):
+            dub._synthesize_chunk("hi", "de-DE-AmalaNeural", tmp_path / "out.mp3")
+        assert len(attempts) == 1, "an unrelated error must not be retried"
 
 
 class TestDownloadVideo:
